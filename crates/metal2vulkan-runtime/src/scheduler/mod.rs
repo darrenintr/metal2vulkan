@@ -97,6 +97,13 @@ pub(crate) struct Scheduler {
 struct SchedulerShared {
     state: Mutex<State>,
     wake: Condvar,
+    /// Commits not yet taken into `state`, in commit order (`Scheduler::commit`): a commit that
+    /// finds the state's lock held leaves its batches here rather than waiting behind the
+    /// holder, which may be in a `vkQueueSubmit`. Whoever next holds the lock and passes takes
+    /// them in order first ([`take_incoming`]).
+    incoming: Mutex<std::collections::VecDeque<Incoming>>,
+    /// `incoming` may hold commits: the thread does not wait while it is set.
+    pending: AtomicBool,
     /// A batch waits at its gate for work to complete: the completion thread wakes the thread
     /// as batches complete.
     gated: AtomicBool,
@@ -120,6 +127,45 @@ pub(crate) struct State {
     /// How many of `decodes` are of untracked textures, whose uses no footprint names: every
     /// batch waits while one is left.
     untracked_decodes: usize,
+}
+
+/// A commit left for the next pass ([`SchedulerShared::incoming`]).
+struct Incoming {
+    buffer: Arc<CommandBufferShared>,
+    queue: u64,
+    batches: Vec<BatchSync>,
+}
+
+/// Takes the commits left in `incoming` into the order, in commit order, as `commit` would
+/// have under the lock. `pending` is cleared first, so a commit left after it is seen again.
+fn take_incoming(shared: &SchedulerShared, state: &mut State) {
+    shared.pending.store(false, Ordering::SeqCst);
+    let commits: Vec<Incoming> = lock(&shared.incoming).drain(..).collect();
+    for Incoming { buffer, queue, batches } in commits {
+        hold_batches(state, &buffer, queue, batches);
+    }
+}
+
+/// Holds `buffer`'s batches, committed on logical queue `queue`, in the order.
+fn hold_batches(state: &mut State, buffer: &Arc<CommandBufferShared>, queue: u64, batches: Vec<BatchSync>) {
+    let count = batches.len();
+    let binary = &mut state.binary;
+    let held: Vec<Held> = batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, batch)| Held {
+            buffer: buffer.hold(),
+            index,
+            last: index + 1 == count,
+            binary_needs: binary.commit(&batch.binary_waits, &batch.binary_signals),
+            waits: batch.waits,
+            binary_signals: batch.binary_signals,
+            segments: batch.segments,
+            gate: None,
+            checked: batch.checked,
+        })
+        .collect();
+    state.order.push(queue, held);
 }
 
 /// A committed batch not yet submitted.
@@ -183,6 +229,8 @@ impl Scheduler {
             }),
             wake: Condvar::new(),
             gated: AtomicBool::new(false),
+            incoming: Mutex::new(std::collections::VecDeque::new()),
+            pending: AtomicBool::new(false),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -210,25 +258,24 @@ impl Scheduler {
         queue: u64,
         batches: Vec<BatchSync>,
     ) {
-        let count = batches.len();
-        let mut state = lock(&self.shared.state);
-        let binary = &mut state.binary;
-        let held: Vec<Held> = batches
-            .into_iter()
-            .enumerate()
-            .map(|(index, batch)| Held {
-                buffer: buffer.hold(),
-                index,
-                last: index + 1 == count,
-                binary_needs: binary.commit(&batch.binary_waits, &batch.binary_signals),
-                waits: batch.waits,
-                binary_signals: batch.binary_signals,
-                segments: batch.segments,
-                gate: None,
-                checked: batch.checked,
-            })
-            .collect();
-        state.order.push(queue, held);
+        // In commit order through `incoming`: a commit that finds the lock held (the thread may
+        // be in a `vkQueueSubmit`) leaves its batches there and wakes the thread, which takes
+        // them first in its next pass, rather than waiting behind the submission.
+        lock(&self.shared.incoming).push_back(Incoming {
+            buffer: Arc::clone(buffer),
+            queue,
+            batches,
+        });
+        self.shared.pending.store(true, Ordering::SeqCst);
+        let mut state = match self.shared.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.shared.wake.notify_all();
+                return;
+            }
+        };
+        take_incoming(&self.shared, &mut state);
         let (mut spent, mut settled) = (Spent::default(), Vec::new());
         let (mut steps, mut checks) = (Vec::new(), Vec::new());
         let mut handlers = Vec::new();
@@ -274,7 +321,8 @@ impl Scheduler {
     /// Whether every batch committed so far was submitted: none is held for an event, a binary
     /// semaphore, a host step or a check (`texture/storage_form.rs`).
     pub(crate) fn holds_none(&self) -> bool {
-        lock(&self.shared.state).order.is_empty()
+        let state = lock(&self.shared.state);
+        state.order.is_empty() && lock(&self.shared.incoming).is_empty()
     }
 
     /// A CPU decode into the decoded twin of the resource `key` was queued: every batch whose
@@ -353,7 +401,7 @@ impl Scheduler {
 fn run(shared: &SchedulerShared) {
     loop {
         let mut state = lock(&shared.state);
-        while !state.dirty && !state.stopping {
+        while !state.dirty && !state.stopping && !shared.pending.load(Ordering::SeqCst) {
             state = shared
                 .wake
                 .wait_timeout(state, WAIT_SLICE)
@@ -364,6 +412,7 @@ fn run(shared: &SchedulerShared) {
             return;
         }
         state.dirty = false;
+        take_incoming(shared, &mut state);
         let (mut spent, mut settled) = (Spent::default(), Vec::new());
         let mut steps = Vec::new();
         let mut checks = Vec::new();
