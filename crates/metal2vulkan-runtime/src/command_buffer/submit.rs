@@ -354,6 +354,21 @@ impl CommandBufferShared {
             })?;
             work.insert(0, staged);
         }
+        // Elsewhere than on MoltenVK the first work is the first command buffer of the batch's
+        // own submission, before the staged copies: in submission order, after the batch's
+        // waits (a superset of the lead's), so what it does and what waits for it are as with a
+        // submission of its own, which cost the device a submission more. Where the batch's
+        // submission fails, nothing of it went, and the first work is given back.
+        let lead = match lead {
+            Some(buffer)
+                if device.properties().description.driver_id
+                    != Some(metal2vulkan::vk::DriverId::MOLTENVK) =>
+            {
+                work.insert(0, buffer);
+                None
+            }
+            lead => lead,
+        };
 
         let mut wait_semaphores = Vec::new();
         let mut wait_values = Vec::new();
