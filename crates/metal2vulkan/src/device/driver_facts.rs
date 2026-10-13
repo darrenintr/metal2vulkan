@@ -36,6 +36,14 @@
 //!   measurement has not cleared. The runtime says so once as such a device is made, in an
 //!   informational message (`metal2vulkan-unmeasured-driver`; no degrade notice, as the paths it
 //!   takes are exact).
+//! - **A stand-in.** A consumer may rule that a GPU answers as a measured one of the same driver,
+//!   vendor and hardware generation: the description then names that identity
+//!   ([`DeviceDescription::facts_stand_in`], [`FactsStandIn`]), and the facts are read at it
+//!   ([`DeviceDescription::facts_identity`]) as on the measured GPU. The only stand-in offered is
+//!   RDNA3's ([`DeviceDescription::rdna3_stand_in`]): a discrete RDNA3 GPU on RADV from Mesa
+//!   26.2.4 reads the Radeon 780M's facts at 26.2.4. The runtime announces it once
+//!   (`metal2vulkan-facts-stand-in`); a lane run on the GPU itself replaces it with a measured
+//!   identity of its own.
 
 use crate::device::description::APPLE_VENDOR_ID;
 use crate::device::profile::DriverWorkaround;
@@ -2148,23 +2156,111 @@ pub(crate) const MEASURED_DEVICES: &[MeasuredDevice] = &[
     },
 ];
 
+/// A measured identity ([`MEASURED_DEVICES`]) whose runtime driver facts and defects a device
+/// takes in place of its own ([`DeviceDescription::facts_stand_in`]): a GPU of the same driver,
+/// vendor and hardware generation, at a measured release. Its consumer chooses it, never the
+/// runtime: an identity not measured otherwise takes no answer fact (the module docs), so a stand-in
+/// is the consumer's ruling that the GPU answers as the one measured, which the runtime announces
+/// once as the device is made (`metal2vulkan-facts-stand-in`). Translation reads none of it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FactsStandIn {
+    /// The measured GPU's `deviceID`.
+    pub device_id: u32,
+    /// The measured release's `driverVersion`.
+    pub driver_version: u32,
+}
+
+/// The first Mesa release whose RADV an RDNA3 GPU may stand in for the Radeon 780M at: the release
+/// the 780M was measured at. Older releases differ in the facts' code paths (RADV's own
+/// preprocessing of generated commands ran the wrong shader through 26.1, `driver_defects.rs` of
+/// the runtime), so a GPU on one keeps its own identity.
+const RDNA3_STAND_IN_FROM: u32 = mesa(26, 2, 4);
+
 impl DeviceDescription {
+    /// The stand-in an AMD discrete RDNA3 GPU (`AMD_RDNA3_DISCRETE`, the Radeon RX 7600 among them)
+    /// takes on RADV (`MESA_RADV`) at Mesa 26.2.4 or later where its consumer asks for one: the
+    /// Radeon 780M at Mesa 26.2.4, the measured identity of the same driver and hardware generation
+    /// (GFX11: one shader ISA, texture and render back-end design, and one RADV code path for
+    /// every fact measured on it). `None` for every other device. A later release takes the
+    /// release measured, as a newer driver of a measured deviation does (the module docs'
+    /// `Beyond`), and the runtime announces the stand-in once. A GPU whose own identity is measured
+    /// takes none: its own facts are read.
+    pub fn rdna3_stand_in(&self) -> Option<FactsStandIn> {
+        let own_measured = MEASURED_DEVICES.iter().any(|m| {
+            Some(m.driver) == self.driver_id
+                && m.vendor == self.vendor_id
+                && m.device == self.device_id
+                && m.release == self.driver_version
+        });
+        let eligible = self.driver_id == Some(DriverId::MESA_RADV)
+            && self.vendor_id == AMD_VENDOR_ID
+            && crate::device::gpus::AMD_RDNA3_DISCRETE.contains(&self.device_id)
+            && self.driver_version >= RDNA3_STAND_IN_FROM
+            && !own_measured;
+        eligible.then_some(FactsStandIn {
+            device_id: AMD_RADEON_780M,
+            driver_version: RDNA3_STAND_IN_FROM,
+        })
+    }
+
+    /// The identity the runtime's driver facts and defects are read at: `driverID`, `vendorID`,
+    /// `deviceID` and `driverVersion`, the stand-in's GPU and release in place of the device's own
+    /// where [`DeviceDescription::facts_stand_in`] names a measured identity of the same driver and
+    /// vendor, else the device's own.
+    pub fn facts_identity(&self) -> (Option<DriverId>, u32, u32, u32) {
+        let own = (
+            self.driver_id,
+            self.vendor_id,
+            self.device_id,
+            self.driver_version,
+        );
+        let Some(stand_in) = self.facts_stand_in else {
+            return own;
+        };
+        let measured = MEASURED_DEVICES.iter().any(|m| {
+            Some(m.driver) == self.driver_id
+                && m.vendor == self.vendor_id
+                && m.device == stand_in.device_id
+                && m.release == stand_in.driver_version
+        });
+        match measured {
+            true => (
+                self.driver_id,
+                self.vendor_id,
+                stand_in.device_id,
+                stand_in.driver_version,
+            ),
+            false => own,
+        }
+    }
+
+    /// Whether the device reads its facts at a stand-in's identity
+    /// ([`DeviceDescription::facts_identity`]).
+    pub fn stands_in(&self) -> bool {
+        let (_, _, device, version) = self.facts_identity();
+        (device, version) != (self.device_id, self.driver_version)
+    }
+
     /// The runtime's driver facts ([`DriverFact`]) of the device this description names (the
-    /// module docs' rule): on a measured identity ([`DeviceDescription::measured_identity`]) those
-    /// its driver's rows name at its release, on its vendor and GPU; on any other identity only the
-    /// defects its driver is measured with on any release or GPU
-    /// ([`DriverFact::assumed_where_unmeasured`]). The runtime relies on an answer fact only where
-    /// the driver has it, and elsewhere takes the exact path that needs none.
+    /// module docs' rule), at its facts identity ([`DeviceDescription::facts_identity`]): on a
+    /// measured identity ([`DeviceDescription::measured_identity`]) those its driver's rows name at
+    /// its release, on its vendor and GPU; on any other identity only the defects its driver is
+    /// measured with on any release or GPU ([`DriverFact::assumed_where_unmeasured`]). The runtime
+    /// relies on an answer fact only where the driver has it, and elsewhere takes the exact path
+    /// that needs none.
     pub fn driver_facts(&self) -> BTreeSet<DriverFact> {
         let measured = self.measured_identity();
+        let (driver, vendor, device, version) = self.facts_identity();
         MEASURED
             .iter()
-            .filter(|row| Some(row.driver) == self.driver_id)
+            .filter(|row| Some(row.driver) == driver)
             .filter(|row| match measured {
                 true => {
-                    (row.first..=row.last).contains(&self.driver_version)
-                        && row.vendor.is_none_or(|v| v == self.vendor_id)
-                        && row.device.is_none_or(|d| d == self.device_id)
+                    (row.first..=row.last).contains(&version)
+                        && row.vendor.is_none_or(|v| v == vendor)
+                        && row.device.is_none_or(|d| d == device)
                 }
                 false => row.fact.assumed_where_unmeasured(),
             })
@@ -2172,17 +2268,19 @@ impl DeviceDescription {
             .collect()
     }
 
-    /// Whether the device's identity (`driverID`, `vendorID`, `deviceID` and `driverVersion`) is
-    /// one the runtime's driver facts were measured on (`MEASURED_DEVICES`, the module docs).
-    /// Another release of a measured driver, another GPU of it, or another driver is not: the
-    /// runtime takes no answer fact there, assumes its driver's measured defects, and says so once
-    /// in the informational message `metal2vulkan-unmeasured-driver`.
+    /// Whether the device's facts identity ([`DeviceDescription::facts_identity`]: `driverID`,
+    /// `vendorID`, `deviceID` and `driverVersion`) is one the runtime's driver facts were measured
+    /// on (`MEASURED_DEVICES`, the module docs). Another release of a measured driver, another GPU
+    /// of it, or another driver is not: the runtime takes no answer fact there, assumes its
+    /// driver's measured defects, and says so once in the informational message
+    /// `metal2vulkan-unmeasured-driver`.
     pub fn measured_identity(&self) -> bool {
+        let (driver, vendor, device, version) = self.facts_identity();
         MEASURED_DEVICES.iter().any(|m| {
-            Some(m.driver) == self.driver_id
-                && m.vendor == self.vendor_id
-                && m.device == self.device_id
-                && m.release == self.driver_version
+            Some(m.driver) == driver
+                && m.vendor == vendor
+                && m.device == device
+                && m.release == version
         })
     }
 

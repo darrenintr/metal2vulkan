@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::device::driver_facts::FactsStandIn;
 use crate::device::profile::{FloatControls, Limits};
 use crate::device::requirements::{ApiVersion, FormatUsage, VkExtension, VkFeature};
 use crate::vk;
@@ -75,6 +76,13 @@ pub struct DeviceDescription {
     /// `maxBufferLength` and the runtime's heap sizes read them from the `Device`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub allocation: AllocationLimits,
+    /// The measured identity whose runtime driver facts and defects the device takes in place of
+    /// its own ([`FactsStandIn`]): `None`, its own (the module docs of `device::driver_facts`).
+    /// The consumer sets it, from [`DeviceDescription::rdna3_stand_in`] alone; nothing queried
+    /// fills it. No translation reads it, so, like `generated_commands`, it is not a profile field:
+    /// two devices that differ only in it share every artifact.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub facts_stand_in: Option<FactsStandIn>,
 }
 
 /// A device's allocation sizes, [`DeviceDescription::allocation`]: device facts that size
@@ -178,6 +186,7 @@ impl DeviceDescription {
             khr_format_feature_flags2: false,
             generated_commands: None,
             allocation: AllocationLimits::default(),
+            facts_stand_in: None,
         }
     }
 

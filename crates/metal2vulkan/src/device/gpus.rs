@@ -17,3 +17,14 @@ pub const NVIDIA_AMPERE_GA10X: &[u32] = &[
     0x25b0, 0x25b2, 0x25b5, 0x25b6, 0x25b8, 0x25b9, 0x25ba, 0x25bb, 0x25bc, 0x25bd, 0x25e0, 0x25e2,
     0x25e5, 0x25ec, 0x25ed, 0x25f9, 0x25fa, 0x25fb,
 ];
+
+/// The `deviceID`s of AMD's discrete RDNA3 GPUs (GFX11: Navi 31, Navi 32 and Navi 33): every
+/// graphics function of pci.ids (version 2026.10.13) under vendor 0x1002 named Navi 31, 32 or 33,
+/// their USB and audio functions left out (19 IDs). 0x7480 is the Radeon RX 7600 and 0x744c the
+/// RX 7900 XTX. None is measured: a device of one may stand in for the measured Radeon 780M
+/// (Phoenix, GFX11 too) where its consumer asks
+/// ([`DeviceDescription::rdna3_stand_in`](crate::device::DeviceDescription::rdna3_stand_in)).
+pub const AMD_RDNA3_DISCRETE: &[u32] = &[
+    0x73f0, 0x7448, 0x7449, 0x744a, 0x744b, 0x744c, 0x745e, 0x7460, 0x7461, 0x7470, 0x747e, 0x7480,
+    0x7481, 0x7483, 0x7487, 0x7489, 0x748b, 0x7499, 0x749f,
+];

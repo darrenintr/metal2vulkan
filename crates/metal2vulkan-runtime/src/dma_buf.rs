@@ -11,6 +11,15 @@
 //!   `VK_AMD_device_coherent_memory`, which the runtime does not enable) among those
 //!   `vkGetMemoryFdPropertiesKHR` and the buffer take. A source that was called is kept with the
 //!   imports ([`DmaBufPages`]) and dropped with them.
+//! - **Shared imports.** A buffer's chunk that is a dma-buf a live import of the device already
+//!   holds (the same dma-buf: the same file of the kernel's dma-buf file system, as a source that
+//!   hands out one dma-buf for the same pages answers) takes that import, where it is of a type the
+//!   chunk's class and buffer take and holds the chunk's bytes, rather than importing it again
+//!   ([`DmaBufImport`]): each import is one more buffer object the driver may pass with every
+//!   submission (RADV lists every imported one on each submit, about 0.55 us each on a Radeon 780M,
+//!   `reims-vgpu`'s `docs/qemu.md`), and two of one dma-buf reach the same pages. The import is
+//!   freed once the last placement over it goes. An image's dedicated import is never shared.
+//!   Counted: `WorkCounts::dma_buf_shared_imports`.
 //! - **The buffer** is a `VkBuffer` made for dma-bufs over the pages from their first byte, so its
 //!   bytes lie at their offset in their first page whatever the chunks, and a rebind between one
 //!   chunk and several keeps their place in it. **One chunk** gives a plain buffer bound at the
@@ -164,7 +173,7 @@ pub struct DmaBufChunk {
 /// (`exit_guard::program`), its panic caught. While the process exits both are left to its end.
 pub(super) struct DmaBufPages {
     device: Device,
-    memories: Vec<vk::DeviceMemory>,
+    memories: Vec<Arc<DmaBufImport>>,
     /// The caller's source; taken only as the pages drop.
     source: Option<DmaBufSource>,
     /// The host address of the first page, and the bytes of the pages: what the source made the
@@ -187,16 +196,55 @@ impl Drop for DmaBufPages {
             return;
         };
         let raw_device = self.device.shared().vk();
-        for &memory in &self.memories {
-            // SAFETY: nothing is bound to the imports any more and no command reads them (the
-            // struct's docs).
-            unsafe { release::object(raw_device, memory) };
+        for import in self.memories.drain(..) {
+            // Another placement's pages may share the import: the last to go frees it.
+            let Some(import) = Arc::into_inner(import) else {
+                continue;
+            };
+            // SAFETY: nothing is bound to the import any more and no command reads it (the
+            // struct's docs), and no other placement holds it.
+            unsafe { release::object(raw_device, import.memory) };
         }
         drop(busy);
         if let Some(source) = self.source.take() {
             exit_guard::program(move || drop(source));
         }
     }
+}
+
+/// One import of a dma-buf: its memory, of type `type_index`, holding `size` bytes. Held by the
+/// pages of every placement over it ([`DmaBufPages`]), and freed by the last of them to go; the
+/// device's memory keeps a weak reference to each buffer chunk's, by the dma-buf's identity
+/// ([`dma_buf_identity`]), so another chunk of the same dma-buf shares it (`Memory::shared_dma_buf`).
+#[derive(Debug)]
+pub(super) struct DmaBufImport {
+    pub(super) memory: vk::DeviceMemory,
+    pub(super) size: u64,
+    pub(super) type_index: u32,
+}
+
+/// The identity of the dma-buf `fd`: its file's device and inode numbers, which the kernel gives
+/// every dma-buf apart (its dma-buf file system numbers each one's inode), so two descriptors of
+/// one dma-buf answer the same; `None` where it has none to read.
+#[cfg(target_os = "linux")]
+pub(super) fn dma_buf_identity(fd: BorrowedFd<'_>) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the descriptor is open for the call, and `fstat` writes the structure.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so it wrote the structure.
+    let stat = unsafe { stat.assume_init() };
+    // The fields' types differ between architectures and C libraries.
+    #[allow(clippy::useless_conversion)]
+    Some((u64::from(stat.st_dev), u64::from(stat.st_ino)))
+}
+
+/// No dma-buf has an identity on this system.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn dma_buf_identity(_fd: BorrowedFd<'_>) -> Option<(u64, u64)> {
+    None
 }
 
 impl DmaBufPages {
@@ -506,14 +554,34 @@ impl Device {
             let types = unsafe { importer.dma_buf_types(raw_device, fd.as_fd()) }
                 .map_err(import_refused)?;
             let allowed = types & requirements.memory_type_bits;
-            let (memory, type_index) = lock(&shared.memory)
+            let identity = dma_buf_identity(fd.as_fd());
+            let mut memory = lock(&shared.memory);
+            // A live import of the same dma-buf serves the chunk (the module docs); the
+            // descriptor, no longer needed, closes as it drops.
+            let live = identity
+                .and_then(|identity| memory.shared_dma_buf(identity, length, (allowed, class)));
+            if let Some(import) = live {
+                shared.counts.dma_buf_import_shared();
+                imported.push((import.memory, import.type_index));
+                pages.memories.push(import);
+                continue;
+            }
+            let (raw, type_index) = memory
                 .import_dma_buf(raw_device, fd, length, (allowed, class), None)
                 .map_err(|failure| match failure {
                     ImportFailure::NoMemoryType => not_importable(),
                     ImportFailure::Vulkan(error) => import_refused(error),
                 })?;
-            pages.memories.push(memory);
-            imported.push((memory, type_index));
+            let import = Arc::new(DmaBufImport {
+                memory: raw,
+                size: length,
+                type_index,
+            });
+            if let Some(identity) = identity {
+                memory.share_dma_buf(identity, &import);
+            }
+            pages.memories.push(import);
+            imported.push((raw, type_index));
         }
         Ok(imported)
     }
@@ -860,7 +928,12 @@ impl Device {
         }
         shared.counts.dma_buf_image_made();
         let mut import = DmaBufPages::new(self, Arc::clone(source), request);
-        import.memories.push(memory);
+        // The image's dedicated import, never shared.
+        import.memories.push(Arc::new(DmaBufImport {
+            memory,
+            size: requirements.size,
+            type_index: texels.type_index,
+        }));
         Ok(Ok(DmaBufImage {
             raw,
             import: Arc::new(import),

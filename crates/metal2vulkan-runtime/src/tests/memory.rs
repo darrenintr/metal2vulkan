@@ -336,3 +336,72 @@ fn short_buffers_are_placed_without_gaps() {
         end = offset + requirements.size;
     }
 }
+
+/// A buffer chunk's dma-buf import is shared by the next chunk of the same dma-buf while it lives,
+/// where it holds that chunk's bytes and is of a type that chunk's class and buffer take; once
+/// the last holder lets it go, the next chunk imports its own. The map of shared imports is
+/// pruned of imports that went as it grows.
+#[cfg(unix)]
+#[test]
+fn a_live_dma_buf_import_is_shared_by_a_chunk_of_the_same_dma_buf() {
+    use crate::dma_buf::DmaBufImport;
+    use crate::memory::Memory;
+    use std::sync::Arc;
+    use vk::MemoryPropertyFlags as P;
+    let flags = [
+        P::DEVICE_LOCAL,
+        P::HOST_VISIBLE | P::HOST_COHERENT,
+        P::HOST_VISIBLE | P::HOST_COHERENT | P::HOST_CACHED,
+    ];
+    let mut properties = vk::PhysicalDeviceMemoryProperties {
+        memory_type_count: flags.len() as u32,
+        ..Default::default()
+    };
+    for (slot, &property_flags) in properties.memory_types.iter_mut().zip(&flags) {
+        *slot = ty(property_flags);
+    }
+    let mut memory = Memory::new(&properties, 1 << 32, true, false, vec![0]);
+    let identity = (7, 42);
+    let shared = (0b110, MemoryClass::Shared);
+    assert!(memory.shared_dma_buf(identity, 4096, shared).is_none());
+    let import = Arc::new(DmaBufImport {
+        memory: vk::DeviceMemory::null(),
+        size: 8192,
+        type_index: 2,
+    });
+    memory.share_dma_buf(identity, &import);
+    let taken = memory.shared_dma_buf(identity, 8192, shared).expect("live");
+    assert!(Arc::ptr_eq(&taken, &import));
+    // More bytes than it holds, a type the chunk's buffer does not take, another dma-buf.
+    assert!(memory.shared_dma_buf(identity, 8193, shared).is_none());
+    assert!(memory
+        .shared_dma_buf(identity, 4096, (0b010, MemoryClass::Shared))
+        .is_none());
+    assert!(memory
+        .shared_dma_buf(identity, 4096, (0b110, MemoryClass::Private))
+        .is_none());
+    assert!(memory.shared_dma_buf((7, 43), 4096, shared).is_none());
+    drop(taken);
+    drop(import);
+    assert!(
+        memory.shared_dma_buf(identity, 4096, shared).is_none(),
+        "gone"
+    );
+    // Imports that went are pruned once the map grows past the first bound.
+    for inode in 0..200 {
+        let gone = Arc::new(DmaBufImport {
+            memory: vk::DeviceMemory::null(),
+            size: 4096,
+            type_index: 2,
+        });
+        memory.share_dma_buf((8, inode), &gone);
+    }
+    let kept = Arc::new(DmaBufImport {
+        memory: vk::DeviceMemory::null(),
+        size: 4096,
+        type_index: 2,
+    });
+    memory.share_dma_buf((9, 0), &kept);
+    assert!(memory.shared_dma_bufs_held() < 64);
+    assert!(memory.shared_dma_buf((9, 0), 4096, shared).is_some());
+}

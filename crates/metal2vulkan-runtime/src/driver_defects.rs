@@ -13,6 +13,12 @@
 //! measured broken or not measured at all, so a release or GPU nobody probed takes the exact path,
 //! and one probed clean then needs only its identity in the list, not new code.
 //!
+//! A device that stands in for a measured identity (`DeviceDescription::facts_stand_in`, the
+//! RDNA3 stand-in of `DeviceOptions::rdna3_stand_in`) has that identity's defects, as it has its
+//! facts: an RDNA3 GPU on RADV from Mesa 26.2.4 has the Radeon 780M's at 26.2.4, so it takes the
+//! driver's own preprocessing of generated commands (`ImplicitPreprocessAfterExecutionSet`, found
+//! clean there and fixed in 26.2.0's source) and keeps the NaN workaround every RADV GPU takes.
+//!
 //! None is a translation's (`DriverWorkaround` covers those), so none is in the compile profile,
 //! a cache key or a digest.
 //!
@@ -260,14 +266,12 @@ pub(super) const AFFECTED: &[Affected] = &[
     },
 ];
 
-/// The defects of the driver and device `description` names.
+/// The defects of the driver and device `description` names, at its facts identity
+/// (`DeviceDescription::facts_identity`: a stand-in's GPU and release where it names one, as the
+/// driver facts are read).
 pub(super) fn of(description: &DeviceDescription) -> BTreeSet<RuntimeDriverDefect> {
-    among(
-        AFFECTED,
-        description.driver_id,
-        description.device_id,
-        description.driver_version,
-    )
+    let (driver, _, device, version) = description.facts_identity();
+    among(AFFECTED, driver, device, version)
 }
 
 /// The defects of `table` that the driver `driver` has on the device `device` at release
