@@ -202,6 +202,20 @@ impl<B> Order<B> {
         Some((queue, sequence, batch, prepared))
     }
 
+    /// Each line whose head is not `behind`, its batches in order, to update in place.
+    pub(crate) fn lines_mut<'a>(
+        &'a mut self,
+        behind: &'a [u64],
+    ) -> impl Iterator<Item = impl Iterator<Item = &'a mut B>> + 'a {
+        self.lines
+            .iter_mut()
+            .filter(move |(_, line)| {
+                line.front()
+                    .is_some_and(|(sequence, _)| !behind.contains(sequence))
+            })
+            .map(|(_, line)| line.iter_mut().map(|(_, batch)| batch))
+    }
+
     /// Each line's head not `behind`, to update in place.
     pub(crate) fn heads_mut<'a>(
         &'a mut self,

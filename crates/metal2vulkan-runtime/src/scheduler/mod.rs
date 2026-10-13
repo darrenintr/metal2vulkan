@@ -64,6 +64,7 @@
 //! [`Point`]: super::tracker::Point
 
 pub(super) mod binary;
+pub(crate) mod coalesce;
 pub(super) mod order;
 
 use super::command_buffer::gate::Hold;
@@ -127,6 +128,9 @@ pub(crate) struct State {
     /// How many of `decodes` are of untracked textures, whose uses no footprint names: every
     /// batch waits while one is left.
     untracked_decodes: usize,
+    /// The batches a pass submitted one after another, made as one submission
+    /// ([`coalesce`]): submitted before the pass ends.
+    pub(crate) coalesced: coalesce::Coalesced,
 }
 
 /// A commit left for the next pass ([`SchedulerShared::incoming`]).
@@ -226,6 +230,7 @@ impl Scheduler {
                 stopping: false,
                 decodes: BTreeMap::new(),
                 untracked_decodes: 0,
+                coalesced: coalesce::Coalesced::default(),
             }),
             wake: Condvar::new(),
             gated: AtomicBool::new(false),
@@ -545,6 +550,10 @@ fn submit_ready(
             if !waiting && !landing {
                 gated.store(false, Ordering::SeqCst);
             }
+            // The run the pass gathered goes before the pass lets go of the lock. A failure lost
+            // the device (`coalesce.rs`): the batches already published finish as it says.
+            drop(busy);
+            let _ = state.coalesced.flush(None);
             return Ok(());
         };
         let submitted = held
@@ -653,32 +662,77 @@ type Steps = Vec<(Hold<CommandBufferShared>, usize)>;
 fn check_heads(state: &mut State, behind: &[u64], checks: &mut Steps, gated: &AtomicBool) -> bool {
     let State { order, binary, .. } = state;
     let mut landing = false;
-    for held in order.heads_mut(behind) {
-        if !held.checked
-            || !binary.ready(&held.binary_needs)
-            || (held.segments && held.buffer.needs_host_step(held.index))
-            || !held.buffer.needs_check(held.index)
-            || checks
-                .iter()
-                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index)
-        {
+    for mut line in order.lines_mut(behind) {
+        let Some(held) = line.next() else {
             continue;
-        }
-        match event_waits(held) {
-            None => continue,
-            Some(waits) if !waits.is_empty() && !held.buffer.device().is_lost() => {
+        };
+        // Whether the head waits for nothing but its checks, if any: its followers' may then
+        // run in this pass, after its own (`check_followers`).
+        let clear = binary.ready(&held.binary_needs)
+            && !(held.segments && held.buffer.needs_host_step(held.index));
+        let due = held.checked
+            && clear
+            && held.buffer.needs_check(held.index)
+            && !checks
+                .iter()
+                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index);
+        let Some(waits) = event_waits(held) else {
+            continue;
+        };
+        let mut waiting = !waits.is_empty();
+        if due {
+            // As before for a head: one whose waits only a GPU signal not yet landed meets
+            // waits at its gate, unless the device is lost.
+            if waiting && !held.buffer.device().is_lost() {
                 gated.store(true, Ordering::SeqCst);
                 fence(Ordering::SeqCst);
-                if event_waits(held).is_some_and(|waits| !waits.is_empty()) {
+                waiting = event_waits(held).is_some_and(|waits| !waits.is_empty());
+                if waiting {
                     landing = true;
                     continue;
                 }
             }
-            Some(_) => {}
+            checks.push((held.buffer.hold(), held.index));
         }
-        checks.push((held.buffer.hold(), held.index));
+        if clear && !waiting {
+            check_followers(&mut line, binary, checks);
+        }
     }
     landing
+}
+
+/// How many batches after a line's head have their checks run in a pass with the head's.
+const CHECKED_AHEAD: usize = 15;
+
+/// The batches after a line's head (`line`) that wait for nothing but their checks: each one's
+/// binary semaphores' signals submitted, its host step recorded and every event value it waits
+/// for reached by the host or the device, up to the first that does not. Their checks go to
+/// `checks` with the head's, in line order, so that the next pass finds them ready one after
+/// another and submits them as one submission (`coalesce.rs`). A check runs before its batch is
+/// submitted and after those of the batches before it, as for a head; only sooner.
+fn check_followers<'a>(
+    line: &mut impl Iterator<Item = &'a mut Held>,
+    binary: &BinarySignals<vk::Semaphore>,
+    checks: &mut Steps,
+) {
+    let mut followers = Vec::new();
+    for held in line.take(CHECKED_AHEAD) {
+        if !binary.ready(&held.binary_needs)
+            || (held.segments && held.buffer.needs_host_step(held.index))
+            || !event_waits(held).is_some_and(|waits| waits.is_empty())
+        {
+            break;
+        }
+        if held.checked
+            && held.buffer.needs_check(held.index)
+            && !checks
+                .iter()
+                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index)
+        {
+            followers.push((held.buffer.hold(), held.index));
+        }
+    }
+    checks.extend(followers);
 }
 
 /// Look at each line's head that is otherwise ready (not `behind` an earlier commit either,
