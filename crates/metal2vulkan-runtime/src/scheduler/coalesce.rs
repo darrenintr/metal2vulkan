@@ -61,12 +61,13 @@ impl Coalesced {
     fn conflicts(&self, part: &Part) -> bool {
         let signals = |s: vk::Semaphore| self.signals.iter().find(|(x, _)| *x == s).map(|e| e.1);
         let waits = |s: vk::Semaphore| self.waits.iter().find(|(x, ..)| *x == s).map(|e| e.1);
-        part.waits.iter().any(|&(s, v, _)| {
-            signals(s).is_some() || waits(s).is_some_and(|w| w == 0 || v == 0)
-        }) || part
-            .signals
+        part.waits
             .iter()
-            .any(|&(s, v)| signals(s).is_some_and(|w| w == 0 || v == 0))
+            .any(|&(s, v, _)| signals(s).is_some() || waits(s).is_some_and(|w| w == 0 || v == 0))
+            || part
+                .signals
+                .iter()
+                .any(|&(s, v)| signals(s).is_some_and(|w| w == 0 || v == 0))
     }
 
     /// Take `part`, `device`'s batch for `VkQueue` `queue` whose failures `relayed` hears, into
@@ -148,7 +149,11 @@ impl Coalesced {
         // one of an unsignaled semaphore with no signal pending (one per run: `conflicts`); the
         // fence is unsignaled and in no pending submission; the queue is used under its lock.
         let submitted = shared.submit_logged(queue, fence, &relayed, |vk_queue| unsafe {
-            raw.queue_submit(vk_queue, std::slice::from_ref(&info), fence.unwrap_or_default())
+            raw.queue_submit(
+                vk_queue,
+                std::slice::from_ref(&info),
+                fence.unwrap_or_default(),
+            )
         });
         exit_guard::called(Call::QueueSubmit);
         // A failed one's fence is its batch's to release (`command_buffer/submit.rs`).
