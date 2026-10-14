@@ -169,6 +169,18 @@ pub struct DeviceOptions {
     /// No Metal counterpart.
     #[doc(hidden)]
     pub record_executions: bool,
+    /// Let an AMD discrete RDNA3 GPU (the Radeon RX 7600 and the other Navi 31, 32 and 33 GPUs) on
+    /// RADV from Mesa 26.2.4 read its driver facts and defects as the Radeon 780M at Mesa 26.2.4,
+    /// the measured identity of the same driver and hardware generation
+    /// (`DeviceDescription::rdna3_stand_in`), where it would otherwise be an identity not measured
+    /// and take the exact path in place of every answer the driver is measured to give. It then
+    /// takes RADV's measured answers: an indexed indirect draw bounded by the device's own range
+    /// rather than the index bounds pass (two draws and a compute pre-pass), a mipmap chain read in
+    /// place rather than copied to scratch first, a resolve in the pass, and generated commands
+    /// preprocessed by the driver itself rather than apart. Off by default ("correct by default":
+    /// no answer is taken on a GPU nobody measured); each device that takes it says so once as it
+    /// is made (`metal2vulkan-facts-stand-in`). Any other device ignores it. No Metal counterpart.
+    pub rdna3_stand_in: bool,
 }
 
 /// One setting of an instance layer (`VkLayerSettingEXT`).
@@ -1070,6 +1082,9 @@ fn create_on(
     if !generated_commands {
         enabled.generated_commands = None;
     }
+    if options.rdna3_stand_in {
+        enabled.facts_stand_in = enabled.rdna3_stand_in();
+    }
     let compile =
         metal2vulkan::device::Device::new(enabled.clone(), options.policy).map_err(device_error)?;
     // SAFETY: as above.
@@ -1356,6 +1371,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         announce_each,
         metal_level,
         record_executions,
+        rdna3_stand_in,
     } = a;
     *policy == b.policy
         && *layers == b.layers
@@ -1374,6 +1390,7 @@ fn same_options(a: &DeviceOptions, b: &DeviceOptions) -> bool {
         && *announce_each == b.announce_each
         && *metal_level == b.metal_level
         && *record_executions == b.record_executions
+        && *rdna3_stand_in == b.rdna3_stand_in
 }
 
 /// The group of `made` for `options`: the live one, or a new one on a new instance. Its index.

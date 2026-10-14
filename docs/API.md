@@ -134,6 +134,16 @@ on MoltenVK 1.4.1 on Apple's M3 Max and M4, with a few per-GPU facts measured el
 GPU or release that was not measured takes the conservative, exact route. A newer MoltenVK release
 takes the measured facts and records `PrecisionNote::BeyondMeasuredDeviation`.
 
+The runtime's driver facts and defects (`DriverFact`, its driver defects) are read the same way but
+on a measured identity alone: the exact driver, vendor, GPU and release a lane ran. A consumer may
+rule that a GPU answers as a measured one of the same driver and generation through
+`DeviceDescription::facts_stand_in`; the one stand-in offered is RDNA3's
+(`DeviceDescription::rdna3_stand_in`, which the runtime's `DeviceOptions::rdna3_stand_in` sets): an
+AMD discrete RDNA3 GPU (`AMD_RDNA3_DISCRETE`: the Radeon RX 7600 and every other Navi 31, 32 and
+33 GPU) on RADV from Mesa 26.2.4 reads them as the Radeon 780M at 26.2.4. Off by default; the
+runtime says so once per device in the informational message metal2vulkan-facts-stand-in. Neither
+the deviations translation reads nor any profile field changes with it.
+
 Metal semantics the translation keeps on every device, beyond Vulkan's: Metal's 32-lane
 simdgroups (including lockstep races on threadgroup memory within a barrier interval), and the
 bit-exact `fneg`, `fabs` and `half`-to-`float` widening of NaNs and denormals. Under the exact

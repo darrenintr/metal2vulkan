@@ -36,7 +36,7 @@
 use super::buffer::usage;
 use super::device::lock;
 #[cfg(unix)]
-use super::dma_buf::DmaBufPages;
+use super::dma_buf::{DmaBufImport, DmaBufPages};
 use super::error::{internal, vulkan, Error, MemoryKind};
 use super::range::RangeAllocator;
 use super::sharing::Sharing;
@@ -50,6 +50,11 @@ use std::sync::Mutex;
 
 /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
 pub(super) const BLOCK_BYTES: u64 = 64 << 20;
+
+/// The entries of the map of shared dma-buf imports at which [`Memory::share_dma_buf`] first
+/// prunes it of imports that went.
+#[cfg(unix)]
+const SHARED_DMA_BUFS_PRUNED_FROM: usize = 64;
 
 /// What memory a resource needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,6 +644,14 @@ pub(super) struct Memory {
     families: Vec<u32>,
     /// The bytes of the blocks allocated so far ([`Memory::allocated`]).
     allocated: u64,
+    /// The live imports of buffers' dma-bufs, by the dma-buf's identity
+    /// (`dma_buf.rs`'s `dma_buf_identity`), for another chunk of the same dma-buf to share
+    /// ([`Memory::shared_dma_buf`]); an entry whose import went stays until the map is pruned.
+    #[cfg(unix)]
+    shared_dma_bufs: std::collections::HashMap<(u64, u64), std::sync::Weak<DmaBufImport>>,
+    /// The entries [`Memory::share_dma_buf`] next prunes the map of shared imports at.
+    #[cfg(unix)]
+    prune_dma_bufs_at: usize,
 }
 
 impl Memory {
@@ -666,6 +679,10 @@ impl Memory {
             unified,
             families,
             allocated: 0,
+            #[cfg(unix)]
+            shared_dma_bufs: std::collections::HashMap::new(),
+            #[cfg(unix)]
+            prune_dma_bufs_at: SHARED_DMA_BUFS_PRUNED_FROM,
         }
     }
 
@@ -1032,6 +1049,44 @@ impl Memory {
             }
         }
         Err(failure)
+    }
+
+    /// The live import of the dma-buf `identity` (`dma_buf.rs`'s `dma_buf_identity`) that a
+    /// buffer's chunk of `size` bytes may take in place of its own: one that holds the bytes, of a
+    /// type among the class's candidates `allowed` names (as [`Memory::import_dma_buf`] would pick
+    /// from). `None` where no such import lives.
+    #[cfg(unix)]
+    pub(super) fn shared_dma_buf(
+        &self,
+        identity: (u64, u64),
+        size: u64,
+        (allowed, class): (u32, MemoryClass),
+    ) -> Option<Arc<DmaBufImport>> {
+        let import = self.shared_dma_bufs.get(&identity)?.upgrade()?;
+        let fits = import.size >= size
+            && candidates(&self.types, allowed, class, self.unified).contains(&import.type_index);
+        fits.then_some(import)
+    }
+
+    /// Keep `import`, a buffer's chunk's import of the dma-buf `identity`, for another chunk of
+    /// the same dma-buf to share while it lives ([`Memory::shared_dma_buf`]), pruning the entries
+    /// of imports that went once the map has grown to twice what it held at the last pruning.
+    #[cfg(unix)]
+    pub(super) fn share_dma_buf(&mut self, identity: (u64, u64), import: &Arc<DmaBufImport>) {
+        self.shared_dma_bufs
+            .insert(identity, Arc::downgrade(import));
+        if self.shared_dma_bufs.len() >= self.prune_dma_bufs_at {
+            self.shared_dma_bufs
+                .retain(|_, import| import.strong_count() > 0);
+            self.prune_dma_bufs_at =
+                (2 * self.shared_dma_bufs.len()).max(SHARED_DMA_BUFS_PRUNED_FROM);
+        }
+    }
+
+    /// The entries the map of shared dma-buf imports holds, live or not, for tests.
+    #[cfg(all(unix, test))]
+    pub(super) fn shared_dma_bufs_held(&self) -> usize {
+        self.shared_dma_bufs.len()
     }
 
     /// The property flags of memory type `index`, where the device has it.

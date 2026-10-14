@@ -18,6 +18,11 @@
 //! paths it takes are exact), naming what it withholds and assumes. A lane that measures a fact runs at the master gate on each venue, so a measured
 //! identity whose answer changes fails there rather than drawing wrong.
 //!
+//! A device that stands in for a measured identity (`DeviceOptions::rdna3_stand_in`,
+//! `DeviceDescription::facts_stand_in`) is measured at that identity, so it says nothing of the
+//! kind; it says instead, once as it is made, which identity it stands in for and what it takes
+//! there (`metal2vulkan-facts-stand-in`, an informational message too).
+//!
 //! A driver diagnostic fact names a message the driver reports inside one call where Vulkan states
 //! nothing wrong: inside that call alone, on a release measured with it, the device withholds that
 //! message from its sink ([`expecting`], [`withholds`]) and counts it
@@ -35,6 +40,9 @@ impl super::Device {
     pub(super) fn say_unmeasured_driver(&self) {
         if let Some(text) = unmeasured_driver(self.properties()) {
             self.inform(UNMEASURED_DRIVER, text);
+        }
+        if let Some(text) = stand_in(self.properties()) {
+            self.inform(FACTS_STAND_IN, text);
         }
     }
 
@@ -110,6 +118,43 @@ pub(crate) fn unmeasured_driver(properties: &super::DeviceProperties) -> Option<
         description.device_id,
         list(withheld),
         list(assumed),
+    ))
+}
+
+/// The id name of the message a device that reads its facts at a stand-in's identity sends as
+/// it is made ([`stand_in`]).
+pub(crate) const FACTS_STAND_IN: &str = "metal2vulkan-facts-stand-in";
+
+/// The text of the informational message a device of `properties` sends as it is made where it
+/// reads its driver facts and defects at a stand-in's identity
+/// (`DeviceDescription::facts_stand_in`, `DeviceOptions::rdna3_stand_in`): naming its own identity,
+/// the stand-in's, and the facts and defects it takes there. `None` elsewhere.
+pub(crate) fn stand_in(properties: &super::DeviceProperties) -> Option<String> {
+    let description = &properties.description;
+    if !description.stands_in() {
+        return None;
+    }
+    let (_, _, device, version) = description.facts_identity();
+    let names = |names: Vec<String>| match names.is_empty() {
+        true => "none".to_owned(),
+        false => names.join(", "),
+    };
+    let facts = (properties.driver_facts.iter())
+        .map(|fact| format!("{fact:?}"))
+        .collect();
+    let defects = (properties.driver_defects.iter())
+        .map(|defect| format!("{defect:?}"))
+        .collect();
+    Some(format!(
+        "metal2vulkan: the device's driver {:?} at driverVersion {:#x} on deviceID {:#x} stands in \
+         for the measured identity deviceID {device:#x} at driverVersion {version:#x}, as its \
+         consumer asked: it takes that identity's measured answers ({}) and works around its \
+         defects ({}), none measured on this GPU [{FACTS_STAND_IN}]",
+        description.driver_id,
+        description.driver_version,
+        description.device_id,
+        names(facts),
+        names(defects),
     ))
 }
 

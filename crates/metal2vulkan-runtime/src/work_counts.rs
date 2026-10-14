@@ -80,6 +80,7 @@ pub(crate) struct Counters {
     draw_states_recorded: AtomicU64,
     host_deallocators_delayed: AtomicU64,
     dma_buf_imports: AtomicU64,
+    dma_buf_shared_imports: AtomicU64,
     dma_buf_sparse_buffers: AtomicU64,
     dma_buf_images: AtomicU64,
     dma_buf_image_fallbacks: AtomicU64,
@@ -426,6 +427,12 @@ impl Counters {
             .fetch_add(chunks as u64, Ordering::Relaxed);
     }
 
+    /// One of those chunks took a live import of the same dma-buf in place of an import of its
+    /// own (`dma_buf.rs`, shared imports).
+    pub(crate) fn dma_buf_import_shared(&self) {
+        self.dma_buf_shared_imports.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A no-copy buffer's (or heap's, or rebind's) `VkBuffer` was assembled from several chunks'
     /// imports as a sparse buffer (`dma_buf.rs`).
     pub(crate) fn dma_buf_sparse_buffer_made(&self) {
@@ -770,6 +777,10 @@ pub struct WorkCounts {
     /// (`HostMemory::with_dma_buf`), where the device refused the pages' pointer: no-copy
     /// buffers', heaps' and rebinds' alike, one per chunk. None where every pointer was imported.
     pub dma_buf_imports: u64,
+    /// Of those chunks, the ones that took a live import of the same dma-buf, which the source
+    /// handed out again for the same pages, in place of an import of their own: each one
+    /// buffer object fewer the driver may pass with every submission.
+    pub dma_buf_shared_imports: u64,
     /// Of those buffers, heaps and rebinds, the ones whose `VkBuffer` is a sparse buffer
     /// assembled from several chunks.
     pub dma_buf_sparse_buffers: u64,
@@ -912,6 +923,7 @@ impl Device {
             draw_states_recorded: counters.draw_states_recorded.load(Ordering::Relaxed),
             host_deallocators_delayed: counters.host_deallocators_delayed.load(Ordering::Relaxed),
             dma_buf_imports: counters.dma_buf_imports.load(Ordering::Relaxed),
+            dma_buf_shared_imports: counters.dma_buf_shared_imports.load(Ordering::Relaxed),
             dma_buf_sparse_buffers: counters.dma_buf_sparse_buffers.load(Ordering::Relaxed),
             dma_buf_images: counters.dma_buf_images.load(Ordering::Relaxed),
             dma_buf_image_fallbacks: counters.dma_buf_image_fallbacks.load(Ordering::Relaxed),

@@ -837,3 +837,73 @@ fn moltenvk_1_4_1_warns_of_a_pipeline_whose_restart_is_dynamic() {
     desc.driver_id = Some(DriverId::MESA_LLVMPIPE);
     assert!(!desc.driver_facts().contains(&RESTART));
 }
+
+/// An AMD discrete RDNA3 GPU on RADV from Mesa 26.2.4 may stand in for the Radeon 780M at 26.2.4,
+/// the measured identity of the same driver and generation: where its description names the
+/// stand-in it is measured there and takes the 780M's facts, at 26.2.4 and at a later release;
+/// without one it is an identity not measured. An earlier release, a GPU of another generation
+/// (Navi 21's 0x73bf), another driver, and a stand-in naming no measured identity take none.
+#[test]
+fn an_rdna3_gpu_stands_in_for_the_780m_where_its_consumer_asks() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../metal2vulkan-validation/profiles");
+    let text = std::fs::read_to_string(dir.join("amd-780m-radv.json")).expect("780M profile");
+    let measured = DeviceDescription::from_khronos_json(&text, None).expect("profile parses");
+    let facts = measured.driver_facts();
+    assert!(facts.contains(&DriverFact::RobustIndexFetchReadsZero));
+    assert!(
+        measured.rdna3_stand_in().is_none(),
+        "the 780M is no RDNA3 dGPU"
+    );
+    assert!(!measured.stands_in());
+
+    // The Radeon RX 7600 (Navi 33) on the same release.
+    let mut rx7600 = measured.clone();
+    rx7600.device_id = 0x7480;
+    assert!(!rx7600.measured_identity());
+    assert!(!rx7600
+        .driver_facts()
+        .contains(&DriverFact::RobustIndexFetchReadsZero));
+    let stand_in = rx7600.rdna3_stand_in().expect("an RDNA3 dGPU at 26.2.4");
+    assert_eq!(
+        (stand_in.device_id, stand_in.driver_version),
+        (0x15bf, mesa(26, 2, 4))
+    );
+    rx7600.facts_stand_in = Some(stand_in);
+    assert!(rx7600.measured_identity());
+    assert!(rx7600.stands_in());
+    assert_eq!(rx7600.driver_facts(), facts);
+    assert!(rx7600.driver_facts_withheld().is_empty());
+    assert_eq!(
+        rx7600.facts_identity(),
+        (Some(DriverId::MESA_RADV), 0x1002, 0x15bf, mesa(26, 2, 4))
+    );
+
+    // A later release takes the release measured.
+    let mut later = rx7600.clone();
+    later.driver_version = mesa(26, 3, 1);
+    assert_eq!(later.rdna3_stand_in(), Some(stand_in));
+    assert_eq!(later.driver_facts(), facts);
+
+    // An earlier release, another generation or another driver is offered none.
+    let mut earlier = rx7600.clone();
+    earlier.driver_version = mesa(26, 2, 3);
+    assert_eq!(earlier.rdna3_stand_in(), None);
+    let mut navi21 = rx7600.clone();
+    navi21.device_id = 0x73bf;
+    assert_eq!(navi21.rdna3_stand_in(), None);
+    let mut amdvlk = rx7600.clone();
+    amdvlk.driver_id = Some(DriverId::AMD_OPEN_SOURCE);
+    assert_eq!(amdvlk.rdna3_stand_in(), None);
+    // A stand-in that names another driver's identity is ignored: the device's own is read.
+    assert!(!amdvlk.measured_identity());
+    assert!(!amdvlk.stands_in());
+
+    // A stand-in naming no measured identity is ignored.
+    let mut unmeasured = rx7600.clone();
+    unmeasured.facts_stand_in = Some(crate::device::FactsStandIn {
+        device_id: 0x15bf,
+        driver_version: mesa(26, 2, 5),
+    });
+    assert!(!unmeasured.stands_in());
+    assert!(!unmeasured.measured_identity());
+}

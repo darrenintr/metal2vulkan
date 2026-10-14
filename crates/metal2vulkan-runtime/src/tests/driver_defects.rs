@@ -220,3 +220,22 @@ fn an_unmeasured_identity_says_so_in_an_informational_message() {
     assert!(text.contains("DepthStencilImagesLieApart"), "{text}");
     assert!(!text.contains("metal2vulkan-degrade-"), "{text}");
 }
+
+/// An RDNA3 GPU that stands in for the Radeon 780M at 26.2.4 (the Radeon RX 7600, `deviceID`
+/// 0x7480, at 26.2.4 or later) has the 780M's defects there: RADV's NaN conversion, not its
+/// preprocessing after an execution set. Without the stand-in it has both.
+#[test]
+fn an_rdna3_stand_in_has_the_780m_s_defects() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../metal2vulkan-validation/profiles/amd-780m-radv.json");
+    let text = std::fs::read_to_string(&path).expect("profile is readable");
+    let mut desc = DeviceDescription::from_khronos_json(&text, None).expect("profile parses");
+    desc.device_id = 0x7480;
+    for release in [MESA_26_2_4, (26 << 22) | (3 << 12)] {
+        desc.driver_version = release;
+        desc.facts_stand_in = None;
+        assert_eq!(of(&desc), [NAN_COPIES, PREPROCESS].into());
+        desc.facts_stand_in = desc.rdna3_stand_in();
+        assert_eq!(of(&desc), [NAN_COPIES].into(), "{release:#x}");
+    }
+}

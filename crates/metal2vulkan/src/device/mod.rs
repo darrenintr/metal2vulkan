@@ -60,7 +60,7 @@ pub use description::{
     AllocationLimits, DeviceDescription, FormatProperties, FormatSupport,
     GeneratedCommandsProperties, SubgroupProperties,
 };
-pub use driver_facts::{DriverDiagnostic, DriverFact};
+pub use driver_facts::{DriverDiagnostic, DriverFact, FactsStandIn};
 pub use enables::{EnableSet, Exposure};
 // The mechanism derivation: internal; a pipeline states each mechanism in its `dependencies`.
 pub(crate) use mechanism::mechanism;
@@ -85,7 +85,7 @@ pub use subgroup::{SimdClass, StageSubgroup, SubgroupModel, SubgroupSizes, Tier}
 // The driver defect a refusal names (`Needs::DriverDefect`).
 pub use profile::DriverWorkaround;
 // The GPU generation a driver workaround and a runtime driver defect key on.
-pub use gpus::NVIDIA_AMPERE_GA10X;
+pub use gpus::{AMD_RDNA3_DISCRETE, NVIDIA_AMPERE_GA10X};
 pub use requirements::{
     ApiVersion, FloatControl, FloatWidth, FormatUsage, Requirements, ResolveMode, SpirvCapability,
     SpirvExtension, StageCreateFlag, SubgroupOp, VkExtension, VkFeature, VkLimit, VkProperty,
