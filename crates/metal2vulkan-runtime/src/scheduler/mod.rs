@@ -443,11 +443,17 @@ pub fn flush_deferred_submissions() -> bool {
     any
 }
 
-/// A pass for `shared`'s deferred commits, if it holds any: whether it did.
+/// `shared`'s deferred commits go to its thread, if it holds any: whether it did. The thread
+/// submits every commit waiting in `incoming` together in its next pass, and what arrives while
+/// it is in a submission goes together in the one after: one submitter, and as few submissions
+/// as the driver's time for each allows, where each deferring thread's own pass would submit
+/// its few alone (on RADV a submission costs every imported buffer object it lists, 1.7 ms with
+/// a thousand, measured under reims-vgpu on an RX 7600, Mesa 26.2.4).
 fn flush(shared: &SchedulerShared) -> bool {
     let held = lock(&shared.deferred_since).is_some();
     if held {
-        pass_now(shared);
+        shared.pending.store(true, Ordering::SeqCst);
+        shared.wake.notify_all();
     }
     held
 }
@@ -569,7 +575,15 @@ fn pass_now(shared: &SchedulerShared) {
 /// The thread's loop. It ends when the device stops it, or once the process is exiting
 /// ([`exit_guard`]): what is held then stays held, as Metal's pending work stays pending.
 fn run(shared: &SchedulerShared) {
+    let stats = std::env::var_os("M2V_SCHED_STATS").is_some();
+    let mut printed = std::time::Instant::now();
     loop {
+        if stats && printed.elapsed() >= Duration::from_secs(1) {
+            printed = std::time::Instant::now();
+            if let Some(line) = coalesce::stats::line() {
+                eprintln!("{line}");
+            }
+        }
         let mut state = lock(&shared.state);
         while !state.dirty && !state.stopping && !shared.pending.load(Ordering::SeqCst) {
             // Deferred commits no pass took within the limit are this thread's to take.
@@ -726,6 +740,9 @@ fn submit_ready(
             // The run the pass gathered goes before the pass lets go of the lock. A failure lost
             // the device (`coalesce.rs`): the batches already published finish as it says.
             drop(busy);
+            if state.coalesced.batches() > 0 {
+                coalesce::stats::end(4);
+            }
             let _ = state.coalesced.flush(None);
             return Ok(());
         };

@@ -31,7 +31,36 @@ use ash::vk;
 use std::sync::Arc;
 
 /// The most batches one submission takes.
-const RUN_LIMIT: usize = 16;
+const RUN_LIMIT: usize = 64;
+
+/// Diagnostics (`M2V_SCHED_STATS`): submissions, the batches they took, and why each run ended.
+pub(crate) mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub(crate) static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static BATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NANOS: AtomicU64 = AtomicU64::new(0);
+    /// Ends: another queue, the limit, a conflict, a fence, the pass's end.
+    pub(crate) static ENDS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    pub(crate) fn end(i: usize) {
+        ENDS[i].fetch_add(1, Relaxed);
+    }
+    /// One line of the last second's counts, reset.
+    pub(crate) fn line() -> Option<String> {
+        let submits = SUBMITS.swap(0, Relaxed);
+        if submits == 0 {
+            return None;
+        }
+        let batches = BATCHES.swap(0, Relaxed);
+        let nanos = NANOS.swap(0, Relaxed);
+        let e: Vec<u64> = ENDS.iter().map(|e| e.swap(0, Relaxed)).collect();
+        Some(format!(
+            "m2v-sched: {submits} submits, {batches} batches ({:.1} a submit), {:.0} us a submit; ends: queue {} limit {} conflict {} fence {} pass {}",
+            batches as f64 / submits as f64,
+            nanos as f64 / submits as f64 / 1e3,
+            e[0], e[1], e[2], e[3], e[4]
+        ))
+    }
+}
 
 /// One batch's part of a submission.
 pub(crate) struct Part {
@@ -56,6 +85,11 @@ pub(crate) struct Coalesced {
 }
 
 impl Coalesced {
+    /// The batches of the run being gathered.
+    pub(crate) fn batches(&self) -> usize {
+        self.batches
+    }
+
     /// Whether `part` cannot join the run: it waits for what the run signals, or it would wait
     /// for or signal a binary semaphore the run already does.
     fn conflicts(&self, part: &Part) -> bool {
@@ -81,10 +115,20 @@ impl Coalesced {
         fence: Option<vk::Fence>,
         relayed: &Arc<Relayed>,
     ) -> Result<(), vk::Result> {
-        if self.batches > 0
-            && (self.queue != Some(queue) || self.batches >= RUN_LIMIT || self.conflicts(&part))
-        {
-            self.flush(None)?;
+        if self.batches > 0 {
+            let end = if self.queue != Some(queue) {
+                Some(0)
+            } else if self.batches >= RUN_LIMIT {
+                Some(1)
+            } else if self.conflicts(&part) {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(end) = end {
+                stats::end(end);
+                self.flush(None)?;
+            }
         }
         self.queue = Some(queue);
         self.device.get_or_insert_with(|| device.clone());
@@ -107,6 +151,7 @@ impl Coalesced {
         }
         self.batches += 1;
         if fence.is_some() {
+            stats::end(3);
             self.flush(fence)?;
         }
         Ok(())
@@ -148,6 +193,7 @@ impl Coalesced {
         // the run's own: `conflicts`), every timeline signal is above its value, every binary
         // one of an unsignaled semaphore with no signal pending (one per run: `conflicts`); the
         // fence is unsignaled and in no pending submission; the queue is used under its lock.
+        let started = std::time::Instant::now();
         let submitted = shared.submit_logged(queue, fence, &relayed, |vk_queue| unsafe {
             raw.queue_submit(
                 vk_queue,
@@ -156,6 +202,12 @@ impl Coalesced {
             )
         });
         exit_guard::called(Call::QueueSubmit);
+        stats::SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats::BATCHES.fetch_add(taken.batches as u64, std::sync::atomic::Ordering::Relaxed);
+        stats::NANOS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // A failed one's fence is its batch's to release (`command_buffer/submit.rs`).
         if submitted.is_err() {
             device.mark_lost();
