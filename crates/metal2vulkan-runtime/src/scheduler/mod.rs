@@ -315,7 +315,7 @@ impl Scheduler {
     /// Whether every batch committed so far was submitted: none is held for an event, a binary
     /// semaphore, a host step or a check (`texture/storage_form.rs`).
     pub(crate) fn holds_none(&self) -> bool {
-        flush(&self.shared);
+        let _ = flush(&self.shared);
         let state = lock(&self.shared.state);
         state.order.is_empty() && lock(&self.shared.incoming).is_empty()
     }
@@ -421,12 +421,14 @@ static ANY_DEFERRED: AtomicBool = AtomicBool::new(false);
 pub fn defer_submissions(on: bool) {
     DEFERRING.with(|d| d.set(on));
     if !on {
-        flush_deferred_submissions();
+        let _ = flush_deferred_submissions();
     }
 }
 
-/// Submit every commit deferred so far, on every device, by passes on this thread.
-pub fn flush_deferred_submissions() {
+/// Submit every commit deferred so far, on every device, by passes on this thread: `true` where
+/// some scheduler held deferred commits, which a caller about to wait for something they may
+/// end checks for again.
+pub fn flush_deferred_submissions() -> bool {
     DEFER_RUN.with(|r| r.set(0));
     let mine: Vec<Weak<SchedulerShared>> = DEFERRED_TO.with(|d| d.borrow_mut().drain(..).collect());
     let others: Vec<Weak<SchedulerShared>> = if ANY_DEFERRED.swap(false, Ordering::SeqCst) {
@@ -434,16 +436,20 @@ pub fn flush_deferred_submissions() {
     } else {
         Vec::new()
     };
+    let mut any = false;
     for shared in mine.iter().chain(&others).filter_map(Weak::upgrade) {
-        flush(&shared);
+        any |= flush(&shared);
     }
+    any
 }
 
-/// A pass for `shared`'s deferred commits, if it holds any.
-fn flush(shared: &SchedulerShared) {
-    if lock(&shared.deferred_since).is_some() {
+/// A pass for `shared`'s deferred commits, if it holds any: whether it did.
+fn flush(shared: &SchedulerShared) -> bool {
+    let held = lock(&shared.deferred_since).is_some();
+    if held {
         pass_now(shared);
     }
+    held
 }
 
 /// Leave a commit already in `incoming` for a later pass (`defer_submissions`).
@@ -474,7 +480,7 @@ fn defer(shared: &Arc<SchedulerShared>) {
         n
     });
     if run >= DEFER_COUNT {
-        flush_deferred_submissions();
+        let _ = flush_deferred_submissions();
     }
 }
 
