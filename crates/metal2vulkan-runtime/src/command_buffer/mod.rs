@@ -1711,6 +1711,8 @@ impl CommandBuffer {
 
     /// `status`.
     pub fn status(&self) -> CommandBufferStatus {
+        // Its submission may be deferred (`scheduler::defer_submissions`): it goes first.
+        crate::scheduler::flush_deferred_submissions();
         self.state().status
     }
 
@@ -1922,6 +1924,8 @@ impl CommandBuffer {
     /// is refused ([`DeadlockCause::SubmissionHandler`]). Once the process is exiting, it answers
     /// as that one does.
     pub fn wait_until_scheduled(&self) -> Result<(), Error> {
+        // Its submission may be deferred (`scheduler::defer_submissions`): it goes first.
+        crate::scheduler::flush_deferred_submissions();
         let scheduled_now = scheduled(&self.state());
         let _blocked = match scheduled_wait(running(), self.0.target(), scheduled_now) {
             Answer::Refuse(cause) => return Err(cause.into()),
@@ -1973,6 +1977,8 @@ impl CommandBuffer {
     ///   with none that is not blocked so ([`DeadlockCause::HandlerThreadCap`]: the runtime's
     ///   cap, above the 256 measured on Metal).
     pub fn wait_until_completed(&self) -> Result<(), Error> {
+        // Its submission may be deferred (`scheduler::defer_submissions`): it goes first.
+        crate::scheduler::flush_deferred_submissions();
         let _blocked = match self.completed_wait() {
             Answer::Return => return Ok(()),
             Answer::Refuse(cause) => return Err(cause.into()),
@@ -1986,6 +1992,8 @@ impl CommandBuffer {
     /// [`CommandBuffer::wait_until_completed`] for at most `timeout`. Where that is refused, it
     /// ends at once with `TimedOut`, as it does once the process is exiting.
     pub fn wait_until_completed_for(&self, timeout: Duration) -> Result<(), TimedOut> {
+        // Its submission may be deferred (`scheduler::defer_submissions`): it goes first.
+        crate::scheduler::flush_deferred_submissions();
         let _blocked = match self.completed_wait() {
             Answer::Return => return Ok(()),
             Answer::Refuse(_) => return Err(TimedOut),
