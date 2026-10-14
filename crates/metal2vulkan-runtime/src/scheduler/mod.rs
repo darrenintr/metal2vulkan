@@ -149,13 +149,23 @@ struct Incoming {
 fn take_incoming(shared: &SchedulerShared, state: &mut State) {
     shared.pending.store(false, Ordering::SeqCst);
     let commits: Vec<Incoming> = lock(&shared.incoming).drain(..).collect();
-    for Incoming { buffer, queue, batches } in commits {
+    for Incoming {
+        buffer,
+        queue,
+        batches,
+    } in commits
+    {
         hold_batches(state, &buffer, queue, batches);
     }
 }
 
 /// Holds `buffer`'s batches, committed on logical queue `queue`, in the order.
-fn hold_batches(state: &mut State, buffer: &Arc<CommandBufferShared>, queue: u64, batches: Vec<BatchSync>) {
+fn hold_batches(
+    state: &mut State,
+    buffer: &Arc<CommandBufferShared>,
+    queue: u64,
+    batches: Vec<BatchSync>,
+) {
     let count = batches.len();
     let binary = &mut state.binary;
     let held: Vec<Held> = batches
@@ -303,10 +313,8 @@ impl Scheduler {
                 &self.shared.gated,
             )
             .is_err();
-            let inline = !exiting
-                && steps.is_empty()
-                && !checks.is_empty()
-                && passes < INLINE_CHECK_PASSES;
+            let inline =
+                !exiting && steps.is_empty() && !checks.is_empty() && passes < INLINE_CHECK_PASSES;
             // The pass was the thread's but for what it runs without the lock: the thread looks
             // again only for that, or for the exit (or for what woke it before, which this pass
             // saw).
