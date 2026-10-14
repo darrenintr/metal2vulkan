@@ -86,6 +86,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+/// The passes `commit` makes at most on the committing thread, running between them the
+/// submission checks a pass found ready (`Scheduler::commit`); what is left then is the thread's.
+const INLINE_CHECK_PASSES: u32 = 4;
+
 /// How long the thread sleeps at most without looking for work.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
@@ -280,33 +284,69 @@ impl Scheduler {
                 return;
             }
         };
-        take_incoming(&self.shared, &mut state);
-        let (mut spent, mut settled) = (Spent::default(), Vec::new());
-        let (mut steps, mut checks) = (Vec::new(), Vec::new());
-        let mut handlers = Vec::new();
-        let exiting = submit_ready(
-            &mut state,
-            (&mut spent, &mut settled),
-            (&mut steps, &mut checks),
-            &mut handlers,
-            &self.shared.gated,
-        )
-        .is_err();
-        // The pass was the thread's but for what it runs without the lock: the thread looks
-        // again only for that, or for the exit (or for what woke it before, which this pass saw).
-        let thread = exiting || !steps.is_empty() || !checks.is_empty();
-        state.dirty = thread;
-        drop(state);
-        settle(settled);
-        // On the committing thread, before `commit` returns.
-        run_submission_handlers(handlers);
-        // Without the lock, as the thread lets go of them: the thread finds the steps and the
-        // checks again in its own pass.
-        drop(spent);
-        drop(steps);
-        drop(checks);
-        if thread {
-            self.shared.wake.notify_all();
+        // A pass, and then, while it leaves the thread nothing but submission checks found
+        // ready, those checks here, without the lock, and another pass: a checked command buffer
+        // whose batches wait for nothing reaches the `VkQueue` before `commit` returns, as an
+        // unchecked one does, without the thread's wake on its path (`INLINE_CHECK_PASSES`).
+        let mut passes = 0;
+        loop {
+            passes += 1;
+            take_incoming(&self.shared, &mut state);
+            let (mut spent, mut settled) = (Spent::default(), Vec::new());
+            let (mut steps, mut checks) = (Vec::new(), Vec::new());
+            let mut handlers = Vec::new();
+            let exiting = submit_ready(
+                &mut state,
+                (&mut spent, &mut settled),
+                (&mut steps, &mut checks),
+                &mut handlers,
+                &self.shared.gated,
+            )
+            .is_err();
+            let inline = !exiting
+                && steps.is_empty()
+                && !checks.is_empty()
+                && passes < INLINE_CHECK_PASSES;
+            // The pass was the thread's but for what it runs without the lock: the thread looks
+            // again only for that, or for the exit (or for what woke it before, which this pass
+            // saw).
+            let thread = !inline && (exiting || !steps.is_empty() || !checks.is_empty());
+            state.dirty = thread;
+            drop(state);
+            settle(settled);
+            // On the committing thread, before `commit` returns.
+            run_submission_handlers(handlers);
+            // Without the lock, as the thread lets go of them: the thread finds the steps and
+            // the checks again in its own pass.
+            drop(spent);
+            drop(steps);
+            if inline {
+                // As the thread runs them: without the lock, each a section of the exit guard;
+                // once the process is exiting, what is left stays held.
+                for (buffer, index) in &checks {
+                    let Some(_busy) = exit_guard::enter() else {
+                        return;
+                    };
+                    buffer.run_checks(*index);
+                }
+                drop(checks);
+                state = match self.shared.state.try_lock() {
+                    Ok(state) => state,
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        // The holder passes after it: the checked batches are its to submit.
+                        self.shared.pending.store(true, Ordering::SeqCst);
+                        self.shared.wake.notify_all();
+                        return;
+                    }
+                };
+                continue;
+            }
+            drop(checks);
+            if thread {
+                self.shared.wake.notify_all();
+            }
+            return;
         }
     }
 
