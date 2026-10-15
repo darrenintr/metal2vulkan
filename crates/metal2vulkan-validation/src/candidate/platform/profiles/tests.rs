@@ -367,6 +367,20 @@ fn a_restricted_context_runs_only_on_a_device_that_has_and_reports_its_profile()
     translated.device_type = native.device_type;
     assert_ne!(translated.driver_id, profile.driver_id);
     assert_eq!(check(&native, &tools, &queried), Ok(translated.clone()));
+    // A runtime fact stand-in is consumer configuration, absent from Vulkan's report. It
+    // imposes no capability requirement and survives applying the restricted profile.
+    let mut hinted = native.clone();
+    hinted.facts_stand_in = Some(metal2vulkan::device::FactsStandIn {
+        device_id: 0x15bf,
+        driver_version: (26 << 22) | (2 << 12) | 4,
+    });
+    assert!(exceeds(&native, &hinted).is_empty());
+    assert!(exceeds(&hinted, &native).is_empty());
+    assert!(differences(&native, &hinted).is_empty());
+    let hinted_profile = check(&hinted, &tools, &queried).unwrap();
+    assert_eq!(hinted_profile.facts_stand_in, hinted.facts_stand_in);
+    hinted.facts_stand_in = None;
+    assert_eq!(hinted, native);
     // So a driver workaround follows the driver that runs the module: the profile on lavapipe's
     // identity carries lavapipe's (and at the gate's Mesa 26.0.8 the misplaced mesh index stores
     // measured there), and the same profile on SwiftShader's identity checks its buffer atomics in
@@ -1189,12 +1203,13 @@ fn a_completed_requirements_document_presents_as_the_product_reads_it_on_every_v
         .flat_map(|venue| venue.devices.iter().map(|device| device.profile.clone()))
         .collect();
     assert_eq!(venue_profiles.len(), 7, "{venue_profiles:?}");
-    let Err(RestrictionError::Mismatch { fields, .. }) = presented(
+    let result = presented(
         &without_block("lunarg-desktop-baseline-2023"),
         "nvidia-rtx5080-laptop",
         2,
-    ) else {
-        panic!("the model presented lunarg-desktop-baseline-2023 as extracted");
+    );
+    let Err(RestrictionError::Mismatch { fields, .. }) = result else {
+        panic!("the model presented lunarg-desktop-baseline-2023 as extracted: {result:?}");
     };
     assert_eq!(
         fields.iter().map(ToString::to_string).collect::<Vec<_>>(),

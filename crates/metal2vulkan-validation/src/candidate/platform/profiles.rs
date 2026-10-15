@@ -613,6 +613,7 @@ pub(super) fn check_restricted(
     translated.vendor_id = native.vendor_id;
     translated.device_id = native.device_id;
     translated.device_type = native.device_type;
+    translated.facts_stand_in = native.facts_stand_in;
     Ok(translated)
 }
 
@@ -714,7 +715,8 @@ fn identity_differences(
 }
 
 /// `description`'s capability members as JSON: everything but its identity, its sets (features
-/// and extensions), and its format table, which are compared typed.
+/// and extensions), its format table, which are compared typed, and its consumer-selected
+/// runtime fact stand-in, which no Vulkan query or translation reads.
 fn capability_members(description: &DeviceDescription) -> Value {
     let mut value = serde_json::to_value(description).expect("a description serializes");
     if let Some(object) = value.as_object_mut() {
@@ -724,6 +726,7 @@ fn capability_members(description: &DeviceDescription) -> Value {
             "vendor_id",
             "device_id",
             "device_type",
+            "facts_stand_in",
             "extensions",
             "features",
             "formats",
