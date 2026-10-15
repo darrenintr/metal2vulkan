@@ -481,6 +481,7 @@ impl Drop for DeviceShared {
         lock(&self.textures.neutrals).destroy(self.vk(), &mut lock(&self.memory));
         // The zeros new resources' first work copied from (`texture/first_move.rs`).
         (self.textures.first_moves).destroy(self.vk(), &mut lock(&self.memory));
+        lock(&self.textures.staging).destroy(self.vk(), &mut lock(&self.memory));
         lock(&self.heaps).destroy(self.vk(), &mut lock(&self.memory));
         lock(&self.owned_kernels).destroy(self.vk());
         lock(&self.mipmap_scratch).destroy(self.vk(), &mut lock(&self.memory));
