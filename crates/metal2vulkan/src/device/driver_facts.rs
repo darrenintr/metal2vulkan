@@ -2156,7 +2156,7 @@ pub(crate) const MEASURED_DEVICES: &[MeasuredDevice] = &[
     },
 ];
 
-/// A measured identity ([`MEASURED_DEVICES`]) whose runtime driver facts and defects a device
+/// A measured identity whose runtime driver facts and defects a device
 /// takes in place of its own ([`DeviceDescription::facts_stand_in`]): a GPU of the same driver,
 /// vendor and hardware generation, at a measured release. Its consumer chooses it, never the
 /// runtime: an identity not measured otherwise takes no answer fact (the module docs), so a stand-in
