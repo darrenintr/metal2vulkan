@@ -16,6 +16,60 @@ use metal2vulkan::metal::format::{direct_format, vk_format, FormatMapping};
 use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan::vk::ImageAspectFlags;
 
+#[test]
+fn packed_host_rows_borrow_only_when_the_used_strides_are_contiguous() {
+    use super::super::copy_plan::HostLayout;
+    use std::borrow::Cow;
+
+    let bytes: Vec<u8> = (0..32).collect();
+    let layout = HostLayout {
+        row_bytes: 2,
+        rows: 2,
+        images: 2,
+        bytes_per_row: 2,
+        bytes_per_image: 4,
+    };
+    let packed = layout.packed(&bytes);
+    assert!(matches!(packed, Cow::Borrowed(_)));
+    assert_eq!(packed.as_ptr(), bytes.as_ptr());
+    assert_eq!(&*packed, &bytes[..8]);
+
+    let padded = HostLayout {
+        bytes_per_row: 4,
+        bytes_per_image: 12,
+        ..layout
+    };
+    let packed = padded.packed(&bytes);
+    assert!(matches!(packed, Cow::Owned(_)));
+    assert_eq!(&*packed, &[0, 1, 4, 5, 12, 13, 16, 17]);
+
+    let overlapping = HostLayout {
+        bytes_per_row: 0,
+        bytes_per_image: 1,
+        ..layout
+    };
+    let packed = overlapping.packed(&bytes);
+    assert!(matches!(packed, Cow::Owned(_)));
+    assert_eq!(&*packed, &[0, 1, 0, 1, 1, 2, 1, 2]);
+
+    let single = HostLayout {
+        rows: 1,
+        images: 1,
+        bytes_per_row: 31,
+        bytes_per_image: 0,
+        ..layout
+    };
+    assert!(matches!(single.packed(&bytes), Cow::Borrowed(_)));
+    let images = HostLayout {
+        rows: 1,
+        bytes_per_row: 31,
+        bytes_per_image: 2,
+        ..layout
+    };
+    assert!(matches!(images.packed(&bytes), Cow::Borrowed(_)));
+    assert_eq!(&*images.packed(&bytes), &bytes[..4]);
+}
+
 fn lavapipe() -> (DeviceDescription, Device) {
     let (_, desc, device) = committed()
         .into_iter()

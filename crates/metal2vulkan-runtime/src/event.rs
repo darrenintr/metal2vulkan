@@ -394,6 +394,8 @@ impl SharedEvent {
     /// Once the process is exiting, it answers at once from the value last seen (a wait already
     /// blocked, within 50 ms): the runtime reads no counter then.
     pub fn wait_until_signaled_value(&self, value: u64, timeout: Duration) -> bool {
+        // A deferred submission may signal it (`scheduler::defer_submissions`): it goes first.
+        let _ = crate::scheduler::flush_deferred_submissions();
         self.0.wait_until(value, timeout)
     }
 

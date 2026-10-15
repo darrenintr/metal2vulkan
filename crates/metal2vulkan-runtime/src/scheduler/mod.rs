@@ -64,6 +64,7 @@
 //! [`Point`]: super::tracker::Point
 
 pub(super) mod binary;
+pub(crate) mod coalesce;
 pub(super) mod order;
 
 use super::command_buffer::gate::Hold;
@@ -79,11 +80,16 @@ use super::tracker::{self, Footprint, Tracker};
 use ash::vk;
 use binary::{BinarySignals, Needs};
 use order::{Behind, Order};
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::atomic::{fence, AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// The passes `commit` makes at most on the committing thread, running between them the
+/// submission checks a pass found ready (`Scheduler::commit`); what is left then is the thread's.
+const INLINE_CHECK_PASSES: u32 = 4;
 
 /// How long the thread sleeps at most without looking for work.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
@@ -97,6 +103,17 @@ pub(crate) struct Scheduler {
 struct SchedulerShared {
     state: Mutex<State>,
     wake: Condvar,
+    /// Commits not yet taken into `state`, in commit order (`Scheduler::commit`): a commit that
+    /// finds the state's lock held leaves its batches here rather than waiting behind the
+    /// holder, which may be in a `vkQueueSubmit`. Whoever next holds the lock and passes takes
+    /// them in order first ([`take_incoming`]).
+    incoming: Mutex<std::collections::VecDeque<Incoming>>,
+    /// `incoming` may hold commits: the thread does not wait while it is set.
+    pending: AtomicBool,
+    /// Since when `incoming` holds commits a deferring thread left there without a pass
+    /// ([`defer_submissions`]): the thread takes them once they are [`DEFER_LIMIT`] old, should
+    /// no pass take them before.
+    deferred_since: Mutex<Option<std::time::Instant>>,
     /// A batch waits at its gate for work to complete: the completion thread wakes the thread
     /// as batches complete.
     gated: AtomicBool,
@@ -120,6 +137,59 @@ pub(crate) struct State {
     /// How many of `decodes` are of untracked textures, whose uses no footprint names: every
     /// batch waits while one is left.
     untracked_decodes: usize,
+    /// The batches a pass submitted one after another, made as one submission
+    /// ([`coalesce`]): submitted before the pass ends.
+    pub(crate) coalesced: coalesce::Coalesced,
+}
+
+/// A commit left for the next pass ([`SchedulerShared::incoming`]).
+struct Incoming {
+    buffer: Arc<CommandBufferShared>,
+    queue: u64,
+    batches: Vec<BatchSync>,
+}
+
+/// Takes the commits left in `incoming` into the order, in commit order, as `commit` would
+/// have under the lock. `pending` is cleared first, so a commit left after it is seen again.
+fn take_incoming(shared: &SchedulerShared, state: &mut State) {
+    shared.pending.store(false, Ordering::SeqCst);
+    *lock(&shared.deferred_since) = None;
+    let commits: Vec<Incoming> = lock(&shared.incoming).drain(..).collect();
+    for Incoming {
+        buffer,
+        queue,
+        batches,
+    } in commits
+    {
+        hold_batches(state, &buffer, queue, batches);
+    }
+}
+
+/// Holds `buffer`'s batches, committed on logical queue `queue`, in the order.
+fn hold_batches(
+    state: &mut State,
+    buffer: &Arc<CommandBufferShared>,
+    queue: u64,
+    batches: Vec<BatchSync>,
+) {
+    let count = batches.len();
+    let binary = &mut state.binary;
+    let held: Vec<Held> = batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, batch)| Held {
+            buffer: buffer.hold(),
+            index,
+            last: index + 1 == count,
+            binary_needs: binary.commit(&batch.binary_waits, &batch.binary_signals),
+            waits: batch.waits,
+            binary_signals: batch.binary_signals,
+            segments: batch.segments,
+            gate: None,
+            checked: batch.checked,
+        })
+        .collect();
+    state.order.push(queue, held);
 }
 
 /// A committed batch not yet submitted.
@@ -180,9 +250,13 @@ impl Scheduler {
                 stopping: false,
                 decodes: BTreeMap::new(),
                 untracked_decodes: 0,
+                coalesced: coalesce::Coalesced::default(),
             }),
             wake: Condvar::new(),
             gated: AtomicBool::new(false),
+            incoming: Mutex::new(std::collections::VecDeque::new()),
+            pending: AtomicBool::new(false),
+            deferred_since: Mutex::new(None),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -210,52 +284,19 @@ impl Scheduler {
         queue: u64,
         batches: Vec<BatchSync>,
     ) {
-        let count = batches.len();
-        let mut state = lock(&self.shared.state);
-        let binary = &mut state.binary;
-        let held: Vec<Held> = batches
-            .into_iter()
-            .enumerate()
-            .map(|(index, batch)| Held {
-                buffer: buffer.hold(),
-                index,
-                last: index + 1 == count,
-                binary_needs: binary.commit(&batch.binary_waits, &batch.binary_signals),
-                waits: batch.waits,
-                binary_signals: batch.binary_signals,
-                segments: batch.segments,
-                gate: None,
-                checked: batch.checked,
-            })
-            .collect();
-        state.order.push(queue, held);
-        let (mut spent, mut settled) = (Spent::default(), Vec::new());
-        let (mut steps, mut checks) = (Vec::new(), Vec::new());
-        let mut handlers = Vec::new();
-        let exiting = submit_ready(
-            &mut state,
-            (&mut spent, &mut settled),
-            (&mut steps, &mut checks),
-            &mut handlers,
-            &self.shared.gated,
-        )
-        .is_err();
-        // The pass was the thread's but for what it runs without the lock: the thread looks
-        // again only for that, or for the exit (or for what woke it before, which this pass saw).
-        let thread = exiting || !steps.is_empty() || !checks.is_empty();
-        state.dirty = thread;
-        drop(state);
-        settle(settled);
-        // On the committing thread, before `commit` returns.
-        run_submission_handlers(handlers);
-        // Without the lock, as the thread lets go of them: the thread finds the steps and the
-        // checks again in its own pass.
-        drop(spent);
-        drop(steps);
-        drop(checks);
-        if thread {
-            self.shared.wake.notify_all();
+        // In commit order through `incoming`: a commit that finds the lock held (the thread may
+        // be in a `vkQueueSubmit`) leaves its batches there and wakes the thread, which takes
+        // them first in its next pass, rather than waiting behind the submission.
+        lock(&self.shared.incoming).push_back(Incoming {
+            buffer: Arc::clone(buffer),
+            queue,
+            batches,
+        });
+        if DEFERRING.with(Cell::get) {
+            defer(&self.shared);
+            return;
         }
+        pass_now(&self.shared);
     }
 
     /// What makes the thread look for work again from any thread: a pipeline a held batch's
@@ -274,7 +315,9 @@ impl Scheduler {
     /// Whether every batch committed so far was submitted: none is held for an event, a binary
     /// semaphore, a host step or a check (`texture/storage_form.rs`).
     pub(crate) fn holds_none(&self) -> bool {
-        lock(&self.shared.state).order.is_empty()
+        let _ = flush(&self.shared);
+        let state = lock(&self.shared.state);
+        state.order.is_empty() && lock(&self.shared.incoming).is_empty()
     }
 
     /// A CPU decode into the decoded twin of the resource `key` was queued: every batch whose
@@ -348,15 +391,212 @@ impl Scheduler {
     }
 }
 
+thread_local! {
+    /// Whether this thread defers its commits' submissions ([`defer_submissions`]).
+    static DEFERRING: Cell<bool> = const { Cell::new(false) };
+    /// The schedulers this thread left commits with since its last flush.
+    static DEFERRED_TO: RefCell<Vec<Weak<SchedulerShared>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The commits a thread defers in a row before it submits them anyway.
+const DEFER_COUNT: usize = 32;
+
+/// How long deferred commits wait at most for a pass before the thread takes them: a deferring
+/// thread that waits on something its own deferred work must end bears at most this much.
+const DEFER_LIMIT: Duration = Duration::from_millis(1);
+
+/// Static registry of the schedulers holding deferred commits, for a flush from any thread.
+static WITH_DEFERRED: Mutex<Vec<Weak<SchedulerShared>>> = Mutex::new(Vec::new());
+
+/// `WITH_DEFERRED` may name a scheduler: a flush with nothing deferred costs one atomic read.
+static ANY_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// From now on, this thread's commits are submitted later, together, rather than each by its own
+/// pass (`on`), or no more, which submits what it deferred. A deferred commit goes into the
+/// scheduler's `incoming` in commit order, where any pass takes it, the thread's included: a
+/// commit from a thread that does not defer, [`flush_deferred_submissions`], any wait for a command
+/// buffer or an event, the deferring thread's `DEFER_COUNT`th commit in a row, or the scheduler's
+/// own thread once the oldest is [`DEFER_LIMIT`] old. Commit order is kept across threads, and no
+/// wait waits on deferred work for long.
+pub fn defer_submissions(on: bool) {
+    DEFERRING.with(|d| d.set(on));
+    if !on {
+        let _ = flush_deferred_submissions();
+    }
+}
+
+/// Submit every commit deferred so far, on every device, by passes on this thread: `true` where
+/// some scheduler held deferred commits, which a caller about to wait for something they may
+/// end checks for again.
+pub fn flush_deferred_submissions() -> bool {
+    DEFER_RUN.with(|r| r.set(0));
+    let mine: Vec<Weak<SchedulerShared>> = DEFERRED_TO.with(|d| d.borrow_mut().drain(..).collect());
+    let others: Vec<Weak<SchedulerShared>> = if ANY_DEFERRED.swap(false, Ordering::SeqCst) {
+        lock(&WITH_DEFERRED).drain(..).collect()
+    } else {
+        Vec::new()
+    };
+    let mut any = false;
+    for shared in mine.iter().chain(&others).filter_map(Weak::upgrade) {
+        any |= flush(&shared);
+    }
+    any
+}
+
+/// `shared`'s deferred commits go to its thread, if it holds any: whether it did. The thread
+/// submits every commit waiting in `incoming` together in its next pass, and what arrives while
+/// it is in a submission goes together in the one after: one submitter, and as few submissions
+/// as the driver's time for each allows, where each deferring thread's own pass would submit
+/// its few alone (on RADV a submission costs every imported buffer object it lists, 1.7 ms with
+/// a thousand, measured under reims-vgpu on an RX 7600, Mesa 26.2.4).
+fn flush(shared: &SchedulerShared) -> bool {
+    let held = lock(&shared.deferred_since).is_some();
+    if held {
+        shared.pending.store(true, Ordering::SeqCst);
+        shared.wake.notify_all();
+    }
+    held
+}
+
+/// Leave a commit already in `incoming` for a later pass (`defer_submissions`).
+fn defer(shared: &Arc<SchedulerShared>) {
+    let first = {
+        let mut since = lock(&shared.deferred_since);
+        let first = since.is_none();
+        if first {
+            *since = Some(std::time::Instant::now());
+        }
+        first
+    };
+    DEFERRED_TO.with(|d| {
+        let mut d = d.borrow_mut();
+        if !d.iter().any(|w| w.as_ptr() == Arc::as_ptr(shared)) {
+            d.push(Arc::downgrade(shared));
+        }
+    });
+    if first {
+        lock(&WITH_DEFERRED).push(Arc::downgrade(shared));
+        ANY_DEFERRED.store(true, Ordering::SeqCst);
+        // The thread takes them at the limit, should no pass come first.
+        shared.wake.notify_all();
+    }
+    let run = DEFER_RUN.with(|r| {
+        let n = r.get() + 1;
+        r.set(n);
+        n
+    });
+    if run >= DEFER_COUNT {
+        let _ = flush_deferred_submissions();
+    }
+}
+
+thread_local! {
+    /// The commits this thread deferred since its last flush.
+    static DEFER_RUN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Submit, on this thread, every batch ready now, the commits in `incoming` taken first (the
+/// second half of [`Scheduler::commit`]): the thread is left only a host step, a check it could
+/// not run here, a held lock, or the exit, and woken for them.
+fn pass_now(shared: &SchedulerShared) {
+    shared.pending.store(true, Ordering::SeqCst);
+    let mut state = match shared.state.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            shared.wake.notify_all();
+            return;
+        }
+    };
+    // A pass, and then, while it leaves the thread nothing but submission checks found
+    // ready, those checks here, without the lock, and another pass: a checked command buffer
+    // whose batches wait for nothing reaches the `VkQueue` before `commit` returns, as an
+    // unchecked one does, without the thread's wake on its path (`INLINE_CHECK_PASSES`).
+    let mut passes = 0;
+    loop {
+        passes += 1;
+        take_incoming(shared, &mut state);
+        let (mut spent, mut settled) = (Spent::default(), Vec::new());
+        let (mut steps, mut checks) = (Vec::new(), Vec::new());
+        let mut handlers = Vec::new();
+        let exiting = submit_ready(
+            &mut state,
+            (&mut spent, &mut settled),
+            (&mut steps, &mut checks),
+            &mut handlers,
+            &shared.gated,
+        )
+        .is_err();
+        let inline =
+            !exiting && steps.is_empty() && !checks.is_empty() && passes < INLINE_CHECK_PASSES;
+        // The pass was the thread's but for what it runs without the lock: the thread looks
+        // again only for that, or for the exit (or for what woke it before, which this pass
+        // saw).
+        let thread = !inline && (exiting || !steps.is_empty() || !checks.is_empty());
+        state.dirty = thread;
+        drop(state);
+        settle(settled);
+        // On the committing thread, before `commit` returns.
+        run_submission_handlers(handlers);
+        // Without the lock, as the thread lets go of them: the thread finds the steps and
+        // the checks again in its own pass.
+        drop(spent);
+        drop(steps);
+        if inline {
+            // As the thread runs them: without the lock, each a section of the exit guard;
+            // once the process is exiting, what is left stays held.
+            for (buffer, index) in &checks {
+                let Some(_busy) = exit_guard::enter() else {
+                    return;
+                };
+                buffer.run_checks(*index);
+            }
+            drop(checks);
+            state = match shared.state.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // The holder passes after it: the checked batches are its to submit.
+                    shared.pending.store(true, Ordering::SeqCst);
+                    shared.wake.notify_all();
+                    return;
+                }
+            };
+            continue;
+        }
+        drop(checks);
+        if thread {
+            shared.wake.notify_all();
+        }
+        return;
+    }
+}
+
 /// The thread's loop. It ends when the device stops it, or once the process is exiting
 /// ([`exit_guard`]): what is held then stays held, as Metal's pending work stays pending.
 fn run(shared: &SchedulerShared) {
+    let stats = std::env::var_os("M2V_SCHED_STATS").is_some();
+    let mut printed = std::time::Instant::now();
     loop {
+        if stats && printed.elapsed() >= Duration::from_secs(1) {
+            printed = std::time::Instant::now();
+            if let Some(line) = coalesce::stats::line() {
+                eprintln!("{line}");
+            }
+        }
         let mut state = lock(&shared.state);
-        while !state.dirty && !state.stopping {
+        while !state.dirty && !state.stopping && !shared.pending.load(Ordering::SeqCst) {
+            // Deferred commits no pass took within the limit are this thread's to take.
+            let slice = match *lock(&shared.deferred_since) {
+                Some(since) => match DEFER_LIMIT.checked_sub(since.elapsed()) {
+                    Some(left) if !left.is_zero() => left,
+                    _ => break,
+                },
+                None => WAIT_SLICE,
+            };
             state = shared
                 .wake
-                .wait_timeout(state, WAIT_SLICE)
+                .wait_timeout(state, slice)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -364,6 +604,7 @@ fn run(shared: &SchedulerShared) {
             return;
         }
         state.dirty = false;
+        take_incoming(shared, &mut state);
         let (mut spent, mut settled) = (Spent::default(), Vec::new());
         let mut steps = Vec::new();
         let mut checks = Vec::new();
@@ -496,6 +737,13 @@ fn submit_ready(
             if !waiting && !landing {
                 gated.store(false, Ordering::SeqCst);
             }
+            // The run the pass gathered goes before the pass lets go of the lock. A failure lost
+            // the device (`coalesce.rs`): the batches already published finish as it says.
+            drop(busy);
+            if state.coalesced.batches() > 0 {
+                coalesce::stats::end(4);
+            }
+            let _ = state.coalesced.flush(None);
             return Ok(());
         };
         let submitted = held
@@ -604,32 +852,77 @@ type Steps = Vec<(Hold<CommandBufferShared>, usize)>;
 fn check_heads(state: &mut State, behind: &[u64], checks: &mut Steps, gated: &AtomicBool) -> bool {
     let State { order, binary, .. } = state;
     let mut landing = false;
-    for held in order.heads_mut(behind) {
-        if !held.checked
-            || !binary.ready(&held.binary_needs)
-            || (held.segments && held.buffer.needs_host_step(held.index))
-            || !held.buffer.needs_check(held.index)
-            || checks
-                .iter()
-                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index)
-        {
+    for mut line in order.lines_mut(behind) {
+        let Some(held) = line.next() else {
             continue;
-        }
-        match event_waits(held) {
-            None => continue,
-            Some(waits) if !waits.is_empty() && !held.buffer.device().is_lost() => {
+        };
+        // Whether the head waits for nothing but its checks, if any: its followers' may then
+        // run in this pass, after its own (`check_followers`).
+        let clear = binary.ready(&held.binary_needs)
+            && !(held.segments && held.buffer.needs_host_step(held.index));
+        let due = held.checked
+            && clear
+            && held.buffer.needs_check(held.index)
+            && !checks
+                .iter()
+                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index);
+        let Some(waits) = event_waits(held) else {
+            continue;
+        };
+        let mut waiting = !waits.is_empty();
+        if due {
+            // As before for a head: one whose waits only a GPU signal not yet landed meets
+            // waits at its gate, unless the device is lost.
+            if waiting && !held.buffer.device().is_lost() {
                 gated.store(true, Ordering::SeqCst);
                 fence(Ordering::SeqCst);
-                if event_waits(held).is_some_and(|waits| !waits.is_empty()) {
+                waiting = event_waits(held).is_some_and(|waits| !waits.is_empty());
+                if waiting {
                     landing = true;
                     continue;
                 }
             }
-            Some(_) => {}
+            checks.push((held.buffer.hold(), held.index));
         }
-        checks.push((held.buffer.hold(), held.index));
+        if clear && !waiting {
+            check_followers(&mut line, binary, checks);
+        }
     }
     landing
+}
+
+/// How many batches after a line's head have their checks run in a pass with the head's.
+const CHECKED_AHEAD: usize = 15;
+
+/// The batches after a line's head (`line`) that wait for nothing but their checks: each one's
+/// binary semaphores' signals submitted, its host step recorded and every event value it waits
+/// for reached by the host or the device, up to the first that does not. Their checks go to
+/// `checks` with the head's, in line order, so that the next pass finds them ready one after
+/// another and submits them as one submission (`coalesce.rs`). A check runs before its batch is
+/// submitted and after those of the batches before it, as for a head; only sooner.
+fn check_followers<'a>(
+    line: &mut impl Iterator<Item = &'a mut Held>,
+    binary: &BinarySignals<vk::Semaphore>,
+    checks: &mut Steps,
+) {
+    let mut followers = Vec::new();
+    for held in line.take(CHECKED_AHEAD) {
+        if !binary.ready(&held.binary_needs)
+            || (held.segments && held.buffer.needs_host_step(held.index))
+            || !event_waits(held).is_some_and(|waits| waits.is_empty())
+        {
+            break;
+        }
+        if held.checked
+            && held.buffer.needs_check(held.index)
+            && !checks
+                .iter()
+                .any(|(buffer, index)| buffer.same(&held.buffer) && *index == held.index)
+        {
+            followers.push((held.buffer.hold(), held.index));
+        }
+    }
+    checks.extend(followers);
 }
 
 /// Look at each line's head that is otherwise ready (not `behind` an earlier commit either,

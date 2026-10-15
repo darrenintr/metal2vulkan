@@ -75,13 +75,26 @@ impl Image {
         copy: vk::BufferImageCopy,
         packed: &[u8],
     ) -> Result<bool, Error> {
+        self.staging_write_with(copy, packed.len() as u64, |mapped| {
+            mapped.copy_from_slice(packed)
+        })
+    }
+
+    /// Fill the staging mapping directly, after checking that this image can take the copy.
+    /// `write` is called only when the copy runs, and the submission completes before returning.
+    pub(super) fn staging_write_with(
+        &self,
+        copy: vk::BufferImageCopy,
+        len: u64,
+        write: impl FnOnce(&mut [u8]),
+    ) -> Result<bool, Error> {
         let detached = lock(&self.detached);
         if detached.is_some() || !self.nothing_staged() {
             return Ok(false);
         }
-        let mut staging = Staging::new(&self.device, packed.len() as u64)?;
-        staging.bytes().copy_from_slice(packed);
-        let (buffer, image) = (staging.raw, self.raw.get());
+        let mut staging = Staging::new(&self.device, len)?;
+        write(staging.bytes());
+        let (buffer, image) = (staging.raw(), self.raw.get());
         self.device.submit_staging(|raw, command_buffer| {
             transfer_barrier(raw, command_buffer, true);
             // SAFETY: the staging command buffer is recording; the staging buffer and the image
@@ -99,6 +112,7 @@ impl Image {
             transfer_barrier(raw, command_buffer, false);
         })?;
         drop(detached);
+        staging.recycle();
         Ok(true)
     }
 
@@ -115,7 +129,7 @@ impl Image {
             return Ok(false);
         }
         let mut staging = Staging::new(&self.device, bytes.len() as u64)?;
-        let (buffer, image) = (staging.raw, self.raw.get());
+        let (buffer, image) = (staging.raw(), self.raw.get());
         self.device.submit_staging(|raw, command_buffer| {
             transfer_barrier(raw, command_buffer, true);
             // SAFETY: the staging command buffer is recording; the staging buffer and the image
@@ -134,6 +148,7 @@ impl Image {
         })?;
         drop(detached);
         bytes.copy_from_slice(staging.bytes());
+        staging.recycle();
         Ok(true)
     }
 }

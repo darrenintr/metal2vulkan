@@ -71,7 +71,7 @@ use super::copy_plan::{
 };
 use super::degradation::Degradation;
 use super::device::lock;
-use super::error::{internal, invalid, nil, vulkan, Error, MemoryKind, Problem, RuntimeGap};
+use super::error::{internal, invalid, nil, vulkan, Error, Problem, RuntimeGap};
 use super::exit_guard;
 use super::families::FormatAnswers;
 use super::framebuffer_fetch::UsageAnswers;
@@ -150,6 +150,7 @@ pub(super) mod heap_two_planes;
 pub(crate) mod host_copy;
 mod rotation;
 mod shared;
+mod staging;
 mod staging_copy;
 pub(super) mod stand_in;
 pub(super) mod storage_form;
@@ -162,6 +163,7 @@ pub(super) mod wrapped;
 mod ycbcr_image;
 
 pub use shared::SharedTextureHandle;
+use staging::Staging;
 pub use wrapped::{VkImageLayouts, WrappedImageProblem};
 
 /// What a device's textures share: the format facts their images are planned from, and how an
@@ -169,6 +171,8 @@ pub use wrapped::{VkImageLayouts, WrappedImageProblem};
 /// it, from the compression data's chunk).
 pub(super) struct TextureState {
     formats: FormatSupport,
+    /// Idle buffers of completed synchronous texture copies.
+    pub(super) staging: Mutex<staging::StagingPool>,
     /// `shaderStorageImageMultisample` is enabled.
     storage_multisample: bool,
     /// What the device's driver is measured to keep in a `D32_SFLOAT` image.
@@ -209,6 +213,7 @@ impl TextureState {
     ) -> TextureState {
         TextureState {
             formats: description.formats.clone(),
+            staging: Mutex::new(staging::StagingPool::default()),
             linear_attachments,
             storage_multisample: description.has(VkFeature::ShaderStorageImageMultisample),
             depth_images: DepthImageFacts::of(&description.driver_facts()),
@@ -3160,13 +3165,14 @@ impl Device {
         if let (true, Some((length, copies))) = (staging_copies, &zero) {
             let mut zeros = Staging::new(self, *length)?;
             zeros.bytes().fill(0);
-            let first = first.zeroed(zeros.raw, copies);
+            let first = first.zeroed(zeros.raw(), copies);
             // SAFETY: the staging command buffer is recording; the image is live, bound to
             // memory of its own, which nothing used yet, and made with transfer usage; every
             // copy lies within it and reads within the zeros.
             self.submit_staging(|raw, command_buffer| unsafe {
                 first.record_alone(raw, command_buffer)
             })?;
+            zeros.recycle();
             return Ok(image);
         }
         // A `Private` texture of the program's (the runtime's own images are held). Dropping
@@ -3780,84 +3786,6 @@ pub(super) fn zero_copies(
         }
     }
     (length, copies)
-}
-
-/// A host-visible buffer `replace_region` and `get_bytes` copy through, released when dropped.
-struct Staging<'a> {
-    device: &'a Device,
-    raw: vk::Buffer,
-    placement: Placement,
-    len: usize,
-}
-
-impl Staging<'_> {
-    /// A staging buffer of `len` bytes.
-    fn new(device: &Device, len: u64) -> Result<Staging<'_>, Error> {
-        let shared = device.shared();
-        let raw_device = shared.vk();
-        let size = usize::try_from(len).map_err(|_| Error::OutOfMemory(MemoryKind::Host))?;
-        let info = shared.sharing().buffer(
-            vk::BufferCreateInfo::default()
-                .size(len)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
-        );
-        // SAFETY: the device is live and `info` valid.
-        let raw = unsafe { raw_device.create_buffer(&info, None) }.map_err(vulkan)?;
-        // SAFETY: `raw` is a live buffer of this device.
-        let requirements = unsafe { raw_device.get_buffer_memory_requirements(raw) };
-        let placement = match crate::memory::allocate(
-            &shared.memory,
-            raw_device,
-            &requirements,
-            MemoryClass::Shared,
-        ) {
-            Ok(placement) => placement,
-            Err(error) => {
-                // SAFETY: the buffer is unused.
-                unsafe { release::object(raw_device, raw) };
-                return Err(error);
-            }
-        };
-        let staging = Staging {
-            device,
-            raw,
-            placement,
-            len: size,
-        };
-        if staging.placement.mapped.is_none() {
-            return Err(Error::OutOfMemory(MemoryKind::Host));
-        }
-        // SAFETY: the placement meets the buffer's requirements and is not bound elsewhere.
-        unsafe {
-            raw_device.bind_buffer_memory(raw, staging.placement.memory, staging.placement.offset)
-        }
-        .map_err(vulkan)?;
-        Ok(staging)
-    }
-
-    /// The staging bytes, through the mapping.
-    fn bytes(&mut self) -> &mut [u8] {
-        let Some(mapped) = self.placement.mapped else {
-            unreachable!("checked when the staging buffer was made");
-        };
-        // SAFETY: the mapping covers the placement's `len` bytes, which only this staging buffer
-        // uses; the memory is host-coherent, and no submission uses it while the slice lives
-        // (`submit_internal` waits for its submission).
-        unsafe { std::slice::from_raw_parts_mut(mapped.as_ptr(), self.len) }
-    }
-}
-
-impl Drop for Staging<'_> {
-    fn drop(&mut self) {
-        // Once the process is exiting, the buffer is left to its end (`exit_guard`).
-        let Some(_busy) = exit_guard::enter() else {
-            return;
-        };
-        let shared = self.device.shared();
-        // SAFETY: every submission that used the buffer completed.
-        unsafe { release::object(shared.vk(), self.raw) };
-        lock(&shared.memory).free(shared.vk(), &self.placement);
-    }
 }
 
 /// The barrier ordering a copy of the internal submission after every earlier access of the
@@ -5078,24 +5006,32 @@ impl Texture {
         let truth = view_shadow::truth(image);
         let copy = buffer_image_copy(&image_region);
         if truth.takes_host_copies() {
-            let mut packed = vec![0; host.packed_len() as usize];
-            host.pack(bytes, &mut packed);
+            let packed = host.packed(bytes);
             if truth.host_write(copy, &packed)? {
                 if denormal {
                     self.degrade_depth_denormals(CALL, image_region.aspect, true);
                 }
-                return truth.decode_written(&image_region, packed);
+                return match truth.decoded.is_some() {
+                    true => truth.decode_written(&image_region, packed.into_owned()),
+                    false => Ok(()),
+                };
             }
         }
         if denormal {
             self.degrade_depth_denormals(CALL, image_region.aspect, false);
         }
         if truth.takes_staging_copies() {
-            let mut packed = vec![0; host.packed_len() as usize];
-            host.pack(bytes, &mut packed);
-            if truth.staging_write(copy, &packed)? {
-                // A decoded twin's decode, staged; on the CPU while a batch may read it.
-                return truth.decode_written(&image_region, packed);
+            if truth.decoded.is_some() {
+                // The decode thread needs its own copy after this call returns.
+                let mut packed = vec![0; host.packed_len() as usize];
+                host.pack(bytes, &mut packed);
+                if truth.staging_write(copy, &packed)? {
+                    return truth.decode_written(&image_region, packed);
+                }
+            } else if truth
+                .staging_write_with(copy, host.packed_len(), |mapped| host.pack(bytes, mapped))?
+            {
+                return Ok(());
             }
         }
         let device = self.device();
@@ -5136,7 +5072,7 @@ impl Texture {
         }
         let mut staging = Staging::new(device, host.packed_len())?;
         host.pack(bytes, staging.bytes());
-        let (buffer, twin, image) = (staging.raw, self.twin_image(), truth.raw.get());
+        let (buffer, twin, image) = (staging.raw(), self.twin_image(), truth.raw.get());
         // The decoded twin's texels of the region, after the copy; the submission is waited for.
         let decode = truth.decode_pass(std::slice::from_ref(&image_region), PassScratch::Own)?;
         truth.submit_copy(|raw, command_buffer| {
@@ -5167,7 +5103,9 @@ impl Texture {
                 // SAFETY: as above; the pass lives until the submission, waited for, completed.
                 unsafe { decode.record(raw, command_buffer) };
             }
-        })
+        })?;
+        staging.recycle();
+        Ok(())
     }
 
     /// `getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:`: read `region` of
@@ -5232,7 +5170,7 @@ impl Texture {
         let staging = Staging::new(device, 2 * words)?;
         // A shadowed view's texels are its texture's (`texture/view_shadow.rs`).
         let truth = view_shadow::truth(image);
-        let (buffer, raw) = (staging.raw, truth.raw.get());
+        let (buffer, raw) = (staging.raw(), truth.raw.get());
         let copy = buffer_image_copy(region);
         truth.submit_copy(|commands, command_buffer| {
             transfer_barrier(commands, command_buffer, true);
@@ -5260,6 +5198,7 @@ impl Texture {
         };
         let mut staging = self.color_texels(image, region, words.len() as u64)?;
         two_planes::narrow(staging.bytes(), words);
+        staging.recycle();
         Ok(())
     }
 
@@ -5275,7 +5214,7 @@ impl Texture {
         let mut staging = self.color_texels(image, region, words.len() as u64)?;
         two_planes::widen(words, staging.bytes());
         let truth = view_shadow::truth(image);
-        let (buffer, raw) = (staging.raw, truth.raw.get());
+        let (buffer, raw) = (staging.raw(), truth.raw.get());
         let copy = buffer_image_copy(region);
         truth.submit_copy(|commands, command_buffer| {
             transfer_barrier(commands, command_buffer, true);
@@ -5291,7 +5230,9 @@ impl Texture {
                 );
             }
             transfer_barrier(commands, command_buffer, false);
-        })
+        })?;
+        staging.recycle();
+        Ok(())
     }
 
     /// `region` of the texture's image into `bytes` laid out as `host` (checked by `get_bytes`).
@@ -5333,7 +5274,7 @@ impl Texture {
         }
         let device = self.device();
         let mut staging = Staging::new(device, host.packed_len())?;
-        let (buffer, image) = (staging.raw, truth.raw.get());
+        let (buffer, image) = (staging.raw(), truth.raw.get());
         truth.submit_copy(|raw, command_buffer| {
             transfer_barrier(raw, command_buffer, true);
             // SAFETY: the internal command buffer is recording; the staging buffer and the image
@@ -5350,6 +5291,7 @@ impl Texture {
             transfer_barrier(raw, command_buffer, false);
         })?;
         host.unpack(staging.bytes(), bytes);
+        staging.recycle();
         Ok(())
     }
 

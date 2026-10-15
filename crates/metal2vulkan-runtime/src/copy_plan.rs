@@ -462,6 +462,20 @@ pub(super) struct HostLayout {
 }
 
 impl HostLayout {
+    /// Borrow already packed rows, otherwise gather them into a tightly packed copy. Strides
+    /// for a single row or image do not matter because the copy never advances by them.
+    pub(super) fn packed<'a>(&self, host: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let len = self.packed_len() as usize;
+        if (self.rows <= 1 || self.bytes_per_row == self.row_bytes)
+            && (self.images <= 1 || self.bytes_per_image == self.row_bytes * self.rows)
+        {
+            return std::borrow::Cow::Borrowed(&host[..len]);
+        }
+        let mut packed = vec![0; len];
+        self.pack(host, &mut packed);
+        std::borrow::Cow::Owned(packed)
+    }
+
     /// The bytes of the tightly packed staging layout.
     pub(super) fn packed_len(&self) -> u64 {
         self.row_bytes * self.rows * self.images

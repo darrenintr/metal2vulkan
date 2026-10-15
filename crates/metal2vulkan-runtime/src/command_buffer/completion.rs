@@ -31,6 +31,12 @@
 //!   wait for one timeline or one fence counts its one signal under a lock, and loses none. The
 //!   value is read again after every wait, so the waiter relies on no wake for the value, only for
 //!   its timing.
+//! - **A waiter finishes what it saw.** A waiter that saw its queue's batches reached finishes
+//!   them itself, as the completion thread would, where it can take the finishing lock and no
+//!   failure is pending: a batch then completes with one thread's wake after the GPU's signal, not
+//!   two. The lock is only ever tried, by the waiters and the completion thread alike, so batches
+//!   finish in the order they are taken and no thread waits behind another; what a waiter could
+//!   not take, and every failure, the completion thread finishes.
 //! - **Waits are bounded.** A waiter waits at most [`WAIT_SLICE`] at a time, so a stop is seen
 //!   promptly and a lost device is reported by the next wait.
 //! - **Exit.** Each wait is a section of the exit guard ([`exit_guard`]), so an exit waits at most
@@ -81,6 +87,10 @@ struct Watch {
     /// Notified on every change a thread waits for: a batch watched, a value reached, a wait
     /// ended, batches finished or taken, a failure, a stop, an exit.
     wake: Condvar,
+    /// Held by whoever takes reached batches and finishes them ([`finish`]): the completion
+    /// thread, or the waiter that saw them reached. Only ever tried, never waited for, so neither
+    /// blocks behind the other, and batches finish in the order they are taken.
+    finishing: Mutex<()>,
 }
 
 struct Pending {
@@ -129,6 +139,7 @@ impl Completion {
                 stopping: false,
             }),
             wake: Condvar::new(),
+            finishing: Mutex::new(()),
         });
         let completion = Completion {
             watch: Arc::clone(&watch),
@@ -213,7 +224,7 @@ fn exit(watch: &Watch) {
 fn run(watch: &Watch) {
     loop {
         // The batches whose values their queues' waiters saw reached, or a waiter's failure.
-        let turn = {
+        let (turn, finishing) = {
             let mut pending = lock(&watch.pending);
             loop {
                 if pending.exiting {
@@ -222,11 +233,14 @@ fn run(watch: &Watch) {
                 if let Some(error) = pending.failed.take() {
                     // No waiter arms until the pending batches are taken (`fail`).
                     pending.holding = true;
-                    break Turn::Failed(error);
+                    break (Turn::Failed(error), None);
                 }
-                let finished = reached(&mut pending);
-                if !finished.is_empty() {
-                    break Turn::Finished(finished);
+                if any_reached(&pending) {
+                    // A waiter finishing batches holds the lock: it takes these too, or wakes
+                    // this thread once it let go.
+                    if let Ok(finishing) = watch.finishing.try_lock() {
+                        break (Turn::Finished(reached(&mut pending)), Some(finishing));
+                    }
                 }
                 if pending.stopping && pending.queues.iter().all(VecDeque::is_empty) {
                     return;
@@ -243,6 +257,24 @@ fn run(watch: &Watch) {
                 continue;
             }
         };
+        let going = finish(watch, finished);
+        drop(finishing);
+        if !going {
+            return;
+        }
+    }
+}
+
+/// Whether some queue's first pending batch's value was seen reached.
+fn any_reached(pending: &Pending) -> bool {
+    (pending.queues.iter().zip(&pending.reached))
+        .any(|(batches, &reached)| batches.front().is_some_and(|batch| batch.value <= reached))
+}
+
+/// Finish `finished`, taken in each queue's order with the finishing lock held (the module docs,
+/// "What a finished batch does"). `false` once the process is exiting: the caller's thread ends.
+fn finish(watch: &Watch, finished: Vec<(usize, Submitted)>) -> bool {
+    {
         // The host time the batches were seen complete: an uncalibrated command buffer's GPU end
         // (`gpu_time.rs`).
         let seen = gpu_time::host_nanos();
@@ -251,7 +283,7 @@ fn run(watch: &Watch) {
             .first()
             .map(|(_, batch)| batch.buffer.device().clone())
         else {
-            continue;
+            return true;
         };
         // Their event signals are seen before the scheduler looks again: a batch whose submission
         // checks wait for a GPU signal to land may now go.
@@ -286,7 +318,7 @@ fn run(watch: &Watch) {
         if let Settled::Signaled = settled {
             let Some(_busy) = exit_guard::enter() else {
                 exit(watch);
-                return;
+                return false;
             };
             for buffer in &ending {
                 buffer.read_stamps();
@@ -303,11 +335,12 @@ fn run(watch: &Watch) {
             // What is pending stays pending, as Metal's does.
             Settled::Exiting => {
                 exit(watch);
-                return;
+                return false;
             }
             Settled::Failed(error) => fail(watch, ending, error),
         }
     }
+    true
 }
 
 /// Every pending batch, and the command buffers `ending` whose work completed (their fences let
@@ -538,8 +571,24 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
                 pending.failed.get_or_insert(error);
             }
         }
+        // What it saw reached, it finishes itself where no one else is finishing and no failure
+        // is pending, without a wake of the completion thread on the batches' path; else the
+        // completion thread does.
+        let finishing = (pending.failed.is_none() && any_reached(&pending))
+            .then(|| watch.finishing.try_lock().ok())
+            .flatten();
+        let finished = finishing.as_ref().map(|_| reached(&mut pending));
         drop(pending);
         watch.wake.notify_all();
+        if let Some(finished) = finished {
+            let going = finish(watch, finished);
+            drop(finishing);
+            // What was reached while it finished is the completion thread's to take.
+            watch.wake.notify_all();
+            if !going {
+                return;
+            }
+        }
     }
 }
 
