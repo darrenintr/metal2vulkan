@@ -70,6 +70,7 @@ use crate::gpu_time;
 use crate::release;
 use crate::replay::Replay;
 use crate::scheduler;
+use crate::scheduler::coalesce::Part;
 use crate::sparse::bind::{bind_batch, BindFailure, Bound};
 use crate::sparse::encoder::SparseUpdate;
 use crate::texture::wrapped::Transition;
@@ -164,6 +165,11 @@ impl CommandBufferShared {
                 .copied()
                 .chain(binary.iter().map(|&semaphore| (semaphore, 0)))
                 .collect();
+            // A bind is a use of the queue of its own: the run gathered so far goes first.
+            scheduler
+                .coalesced
+                .flush(None)
+                .map_err(|error| submission_error(device, error))?;
             let Bound {
                 unbound,
                 signalled,
@@ -354,6 +360,21 @@ impl CommandBufferShared {
             })?;
             work.insert(0, staged);
         }
+        // Elsewhere than on MoltenVK the first work is the first command buffer of the batch's
+        // own submission, before the staged copies: in submission order, after the batch's
+        // waits (a superset of the lead's), so what it does and what waits for it are as with a
+        // submission of its own, which cost the device a submission more. Where the batch's
+        // submission fails, nothing of it went, and the first work is given back.
+        let lead = match lead {
+            Some(buffer)
+                if device.properties().description.driver_id
+                    != Some(metal2vulkan::vk::DriverId::MOLTENVK) =>
+            {
+                work.insert(0, buffer);
+                None
+            }
+            lead => lead,
+        };
 
         let mut wait_semaphores = Vec::new();
         let mut wait_values = Vec::new();
@@ -508,7 +529,28 @@ impl CommandBufferShared {
         // The first work's submission, with no fence, is the batch's lead: where the batch's
         // fails after it was made, a submission of no work signals a fence of its own once the
         // first work completed (the device's fences, inside the scheduler's section).
-        let submitted = shared.submit_logged(queue, fence, &self.relayed, |vk_queue| unsafe {
+        // Where the queue's failures are not relayed and no first work goes on its own, the
+        // batch joins the scheduler's run of consecutive batches, one submission
+        // (`scheduler/coalesce.rs`); elsewhere the run goes first, and the batch on its own.
+        let coalesce = shared.flights(queue).is_none() && lead_buffers.is_empty();
+        let submitted = if coalesce {
+            let waits = (wait_semaphores.iter().zip(&wait_values).zip(&wait_stages))
+                .chain(order_semaphores.iter().zip(&order_values).zip(&order_stages))
+                .map(|((&s, &v), &stages)| (s, v, stages))
+                .collect();
+            let part = Part {
+                waits,
+                buffers: work.iter().chain(finale.iter()).copied().collect(),
+                signals: (signal_semaphores.iter().copied())
+                    .zip(signal_values.iter().copied())
+                    .collect(),
+            };
+            scheduler
+                .coalesced
+                .add(device, queue, part, fence, &self.relayed)
+        } else {
+            scheduler.coalesced.flush(None).and_then(|()| {
+        shared.submit_logged(queue, fence, &self.relayed, |vk_queue| unsafe {
             if !lead_buffers.is_empty() {
                 raw.queue_submit(
                     vk_queue,
@@ -530,7 +572,9 @@ impl CommandBufferShared {
                 }
             }
             made
-        });
+        })
+            })
+        };
         exit_guard::called(Call::QueueSubmit);
         if let Err(error) = submitted {
             if let Some(fence) = fence {

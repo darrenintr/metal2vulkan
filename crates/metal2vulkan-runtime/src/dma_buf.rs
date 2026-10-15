@@ -108,8 +108,9 @@ use std::time::Duration;
 /// calls is dropped with the call; one it called is kept with the imports it made, until they go.
 ///
 /// It returns dma-bufs of the pages asked for ([`DmaBufRequest`]) in chunks ([`DmaBufChunk`]), in
-/// order: each chunk's length a positive multiple of the host page, at most its dma-buf's size,
-/// and every boundary between two chunks, as an offset from the request's `start`, a multiple of
+/// order: each chunk's length a positive multiple of the host page, its offset into its dma-buf
+/// 0 or, where the request takes offsets, a multiple of its `offset_alignment`, its bytes within
+/// the dma-buf's size, and every boundary between two chunks, as an offset from the request's `start`, a multiple of
 /// its `granule`. The descriptors are the runtime's from then on: Vulkan's once imported, closed
 /// otherwise. An `Err` keeps the pointer's refusal (`Unsupported`, `HostMemory`), or makes a
 /// texture a shadow of the bytes instead (announced `shadowed-texture`); chunks that break these
@@ -144,6 +145,16 @@ pub struct DmaBufRequest {
     /// (a multiple of the host page); `length` where it does not, so that exactly one chunk is
     /// taken.
     pub granule: u64,
+    /// The multiple of which a chunk's [`offset`](DmaBufChunk::offset) into its dma-buf must be,
+    /// where the runtime binds a chunk at an offset into its import: the alignment of the buffer
+    /// it binds the chunks to (a multiple of the host page). 0 where it takes no offsets (an
+    /// image's dedicated import), so every chunk's offset must be 0.
+    ///
+    /// A source that answers chunks at offsets into a larger dma-buf (a window of a file's pages
+    /// that many buffers lie in) lets the runtime import that dma-buf once for all of them
+    /// (shared imports): each import is one more buffer object the driver may pass with every
+    /// submission.
+    pub offset_alignment: u64,
 }
 
 // SAFETY: a request is an address and two lengths, plain data: nothing is reached through the
@@ -152,12 +163,15 @@ unsafe impl Send for DmaBufRequest {}
 // SAFETY: as above.
 unsafe impl Sync for DmaBufRequest {}
 
-/// One chunk of a [`DmaBufSource`]'s answer: a dma-buf whose bytes `0..length` are the requested
-/// pages from where the chunks before it end.
+/// One chunk of a [`DmaBufSource`]'s answer: a dma-buf whose bytes `offset..offset + length` are
+/// the requested pages from where the chunks before it end.
 #[derive(Debug)]
 pub struct DmaBufChunk {
     /// The dma-buf.
     pub fd: OwnedFd,
+    /// Where the chunk's bytes start in the dma-buf: 0, or a multiple of the request's
+    /// `offset_alignment` where it is not 0.
+    pub offset: u64,
     /// The bytes of the chunk, a multiple of the host page.
     pub length: u64,
 }
@@ -332,9 +346,19 @@ pub(super) fn chunks_cover(lengths: &[u64], request: &DmaBufRequest, page: u64) 
 fn answers(chunks: &[DmaBufChunk], request: &DmaBufRequest, page: u64) -> bool {
     let lengths: Vec<u64> = chunks.iter().map(|chunk| chunk.length).collect();
     let held = |chunk: &DmaBufChunk| {
-        dma_buf_length(chunk.fd.as_fd()).is_some_and(|bytes| chunk.length <= bytes)
+        offset_taken(chunk.offset, request.offset_alignment)
+            && chunk.offset.checked_add(chunk.length).is_some_and(|end| {
+                dma_buf_length(chunk.fd.as_fd()).is_some_and(|bytes| end <= bytes)
+            })
     };
     chunks_cover(&lengths, request, page) && chunks.iter().all(held)
+}
+
+/// Whether a chunk may start `offset` bytes into its dma-buf for a request of `alignment`
+/// ([`DmaBufRequest::offset_alignment`]): at 0 always, elsewhere only at a multiple of a
+/// request's alignment that is not 0.
+pub(super) fn offset_taken(offset: u64, alignment: u64) -> bool {
+    offset == 0 || (alignment != 0 && offset.is_multiple_of(alignment))
 }
 
 /// The bytes of the dma-buf `fd`; `None` where it is no dma-buf (its file is not on the kernel's
@@ -406,10 +430,17 @@ impl Device {
             Some(granule) if granule < window.size => granule,
             _ => window.size,
         };
+        // A chunk binds at its offset into its import: at the sparse buffer's alignment where
+        // several chunks are bound, else at a plain buffer's.
+        let offset_alignment = match granule < window.size {
+            true => granule,
+            false => self.plain_alignment(importer),
+        };
         let request = DmaBufRequest {
             start,
             length: window.size,
             granule,
+            offset_alignment,
         };
         let chunks = source(request).map_err(|_| not_importable())?;
         if !answers(&chunks, &request, importer.page) {
@@ -454,6 +485,7 @@ impl Device {
         let shared = self.shared();
         let raw_device = shared.vk();
         let lengths: Vec<u64> = chunks.iter().map(|chunk| chunk.length).collect();
+        let offsets: Vec<u64> = chunks.iter().map(|chunk| chunk.offset).collect();
         let size: u64 = lengths.iter().sum();
         // A range the binding layer pads to 16 bytes from the bytes stays inside the buffer, as
         // a pointer's import holds it (`based_size`).
@@ -481,32 +513,40 @@ impl Device {
         let requirements = unsafe { raw_device.get_buffer_memory_requirements(raw) };
         let bound = (|| {
             let alignment = requirements.alignment.max(1);
-            let fits = match sparse {
-                // Each chunk binds whole at its offset, which the alignment must divide, as it
-                // must divide each chunk's length.
-                true => lengths
-                    .iter()
-                    .all(|length| length.is_multiple_of(alignment)),
-                false => requirements.size <= size,
-            };
+            // Each chunk binds at its offset into its import, which the alignment must divide.
+            let at_offsets = offsets
+                .iter()
+                .all(|offset| offset.is_multiple_of(alignment));
+            let fits = at_offsets
+                && match sparse {
+                    // Each chunk binds whole at its offset in the buffer, which the alignment
+                    // must divide, as it must divide each chunk's length.
+                    true => lengths
+                        .iter()
+                        .all(|length| length.is_multiple_of(alignment)),
+                    false => requirements.size <= size,
+                };
             if !fits {
                 return Err(not_importable());
             }
             let memories = self.import_chunks(importer, chunks, pages, &requirements, class)?;
             if !sparse {
                 // SAFETY: the buffer is unbound, made for dma-bufs; the memory is of a type it
-                // takes and holds its requirements from 0.
-                unsafe { raw_device.bind_buffer_memory(raw, memories[0].0, 0) }.map_err(vulkan)?;
+                // takes and holds its requirements from the chunk's offset, which the alignment
+                // divides (the chunk's bytes lie within the dma-buf, `answers`, and the
+                // requirements' size within the chunk's).
+                unsafe { raw_device.bind_buffer_memory(raw, memories[0].0, offsets[0]) }
+                    .map_err(vulkan)?;
                 return Ok(memories[0]);
             }
             let mut offset = 0;
-            let binds: Vec<vk::SparseMemoryBind> = (memories.iter().zip(&lengths))
-                .map(|(&(memory, _), &length)| {
+            let binds: Vec<vk::SparseMemoryBind> = (memories.iter().zip(&lengths).zip(&offsets))
+                .map(|((&(memory, _), &length), &at)| {
                     let bind = vk::SparseMemoryBind::default()
                         .resource_offset(offset)
                         .size(length)
                         .memory(memory)
-                        .memory_offset(0);
+                        .memory_offset(at);
                     offset += length;
                     bind
                 })
@@ -549,7 +589,11 @@ impl Device {
         let shared = self.shared();
         let raw_device = shared.vk();
         let mut imported = Vec::with_capacity(chunks.len());
-        for DmaBufChunk { fd, length } in chunks {
+        for DmaBufChunk { fd, offset, length } in chunks {
+            // The import holds the dma-buf whole, so that a chunk at another offset of it shares
+            // it (`answers` checked the chunk lies within it).
+            let end = offset + length;
+            let size = dma_buf_length(fd.as_fd()).map_or(end, |bytes| bytes.max(end));
             // SAFETY: the importer is this device's, and the descriptor a dma-buf.
             let types = unsafe { importer.dma_buf_types(raw_device, fd.as_fd()) }
                 .map_err(import_refused)?;
@@ -559,7 +603,7 @@ impl Device {
             // A live import of the same dma-buf serves the chunk (the module docs); the
             // descriptor, no longer needed, closes as it drops.
             let live = identity
-                .and_then(|identity| memory.shared_dma_buf(identity, length, (allowed, class)));
+                .and_then(|identity| memory.shared_dma_buf(identity, end, (allowed, class)));
             if let Some(import) = live {
                 shared.counts.dma_buf_import_shared();
                 imported.push((import.memory, import.type_index));
@@ -567,14 +611,14 @@ impl Device {
                 continue;
             }
             let (raw, type_index) = memory
-                .import_dma_buf(raw_device, fd, length, (allowed, class), None)
+                .import_dma_buf(raw_device, fd, size, (allowed, class), None)
                 .map_err(|failure| match failure {
                     ImportFailure::NoMemoryType => not_importable(),
                     ImportFailure::Vulkan(error) => import_refused(error),
                 })?;
             let import = Arc::new(DmaBufImport {
                 memory: raw,
-                size: length,
+                size,
                 type_index,
             });
             if let Some(identity) = identity {
@@ -618,6 +662,36 @@ impl Device {
                 .max(1)
                 .checked_next_multiple_of(importer.page)
                 .filter(|granule| granule.is_multiple_of(alignment.max(1)))
+        })
+    }
+
+    /// The alignment of a plain buffer made for dma-bufs ([`Importer::plain_alignment`]), at
+    /// least the host page: where a chunk's offset into its import must lie when one chunk is
+    /// bound to such a buffer. The host page where the device makes none to ask.
+    fn plain_alignment(&self, importer: &Importer) -> u64 {
+        *importer.plain_alignment.get_or_init(|| {
+            let shared = self.shared();
+            let raw_device = shared.vk();
+            let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(DMA_BUF);
+            let info = shared.sharing().buffer(
+                vk::BufferCreateInfo::default()
+                    .size(importer.page)
+                    .usage(usage(shared.device_address))
+                    .push_next(&mut external),
+            );
+            // SAFETY: the device is live, and `info` and its chain are valid.
+            let Ok(raw) = (unsafe { raw_device.create_buffer(&info, None) }) else {
+                return importer.page;
+            };
+            shared.counts.buffer_made(info.usage);
+            // SAFETY: `raw` is a live buffer of this device.
+            let alignment = unsafe { raw_device.get_buffer_memory_requirements(raw) }.alignment;
+            // SAFETY: the buffer is unused.
+            unsafe { release::object(raw_device, raw) };
+            alignment
+                .max(1)
+                .checked_next_multiple_of(importer.page)
+                .unwrap_or(importer.page)
         })
     }
 
@@ -842,6 +916,7 @@ impl Device {
                 start,
                 length,
                 granule: length,
+                offset_alignment: 0,
             },
         }))
     }
