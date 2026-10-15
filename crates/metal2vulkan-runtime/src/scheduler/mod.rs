@@ -415,8 +415,8 @@ static ANY_DEFERRED: AtomicBool = AtomicBool::new(false);
 /// pass (`on`), or no more, which submits what it deferred. A deferred commit goes into the
 /// scheduler's `incoming` in commit order, where any pass takes it, the thread's included: a
 /// commit from a thread that does not defer, [`flush_deferred_submissions`], any wait for a command
-/// buffer or an event, the deferring thread's `DEFER_COUNT`th commit in a row, or the scheduler's
-/// own thread once the oldest is [`DEFER_LIMIT`] old. Commit order is kept across threads, and no
+/// buffer or an event, the deferring thread's 32nd commit in a row, or the scheduler's
+/// own thread once the oldest is 1 ms old. Commit order is kept across threads, and no
 /// wait waits on deferred work for long.
 pub fn defer_submissions(on: bool) {
     DEFERRING.with(|d| d.set(on));
