@@ -239,7 +239,9 @@ surface! {
         enum DriverWorkaround N;
         enum DriverFact N;
         struct DriverDiagnostic N;
+        struct FactsStandIn N;
         const NVIDIA_AMPERE_GA10X;
+        const AMD_RDNA3_DISCRETE;
         enum GuestIsolation N;
         enum HandleDomain N;
         enum Independence N;
