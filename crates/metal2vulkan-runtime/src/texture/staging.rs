@@ -6,6 +6,7 @@ use super::super::device::lock;
 use super::super::error::{vulkan, Error, MemoryKind};
 use super::super::exit_guard;
 use super::super::memory::{Memory, MemoryClass, Placement};
+use super::super::sharing::Sharing;
 use super::super::Device;
 use crate::release;
 use ash::vk;
@@ -13,6 +14,20 @@ use ash::vk;
 const MAX_BYTES: u64 = 64 << 20;
 const MAX_BUFFER: u64 = 16 << 20;
 const MAX_BUFFERS: usize = 16;
+
+/// A pooled buffer can serve both submission paths on successive leases. Include the dedicated
+/// staging family too: waiting for a submission does not transfer an exclusive buffer's owner.
+fn buffer_info<'a>(
+    len: u64,
+    graphics: Sharing<'a>,
+    staging: Option<Sharing<'a>>,
+) -> vk::BufferCreateInfo<'a> {
+    staging.unwrap_or(graphics).buffer(
+        vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+    )
+}
 
 /// Idle buffers with their usable capacity and allocation size. The latter bounds retained
 /// placements, including the device's alignment padding, rather than only the bytes copied.
@@ -111,11 +126,7 @@ impl Staging<'_> {
             });
         }
         let raw_device = shared.vk();
-        let info = shared.sharing().buffer(
-            vk::BufferCreateInfo::default()
-                .size(len)
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
-        );
+        let info = buffer_info(len, shared.sharing(), device.staging_sharing());
         // SAFETY: the device is live and `info` valid.
         let raw = unsafe { raw_device.create_buffer(&info, None) }.map_err(vulkan)?;
         // SAFETY: `raw` is a live buffer of this device.
@@ -212,6 +223,31 @@ impl Drop for Staging<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pooled_buffers_include_the_dedicated_transfer_family() {
+        let graphics = [2];
+        let both = [2, 5];
+        let info = buffer_info(4096, Sharing::new(&graphics), Some(Sharing::new(&both)));
+        assert!(info.sharing_mode == vk::SharingMode::CONCURRENT);
+        assert_eq!(info.queue_family_index_count, 2);
+        assert_eq!(info.p_queue_family_indices, both.as_ptr());
+        assert_eq!(info.size, 4096);
+        assert!(info.usage.contains(vk::BufferUsageFlags::TRANSFER_SRC));
+        assert!(info.usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
+    }
+
+    #[test]
+    fn a_device_without_a_transfer_queue_keeps_its_graphics_sharing() {
+        let families = [2, 3];
+        let info = buffer_info(4096, Sharing::new(&families), None);
+        assert!(info.sharing_mode == vk::SharingMode::CONCURRENT);
+        assert_eq!(info.queue_family_index_count, 2);
+        assert_eq!(info.p_queue_family_indices, families.as_ptr());
+        let family = [2];
+        let info = buffer_info(4096, Sharing::new(&family), None);
+        assert!(info.sharing_mode == vk::SharingMode::EXCLUSIVE);
+    }
 
     #[test]
     fn leases_are_exclusive_and_choose_the_smallest_sufficient_buffer() {
