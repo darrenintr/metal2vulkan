@@ -535,7 +535,12 @@ impl CommandBufferShared {
         let coalesce = shared.flights(queue).is_none() && lead_buffers.is_empty();
         let submitted = if coalesce {
             let waits = (wait_semaphores.iter().zip(&wait_values).zip(&wait_stages))
-                .chain(order_semaphores.iter().zip(&order_values).zip(&order_stages))
+                .chain(
+                    order_semaphores
+                        .iter()
+                        .zip(&order_values)
+                        .zip(&order_stages),
+                )
                 .map(|((&s, &v), &stages)| (s, v, stages))
                 .collect();
             let part = Part {
@@ -550,29 +555,30 @@ impl CommandBufferShared {
                 .add(device, queue, part, fence, &self.relayed)
         } else {
             scheduler.coalesced.flush(None).and_then(|()| {
-        shared.submit_logged(queue, fence, &self.relayed, |vk_queue| unsafe {
-            if !lead_buffers.is_empty() {
-                raw.queue_submit(
-                    vk_queue,
-                    std::slice::from_ref(&lead_info),
-                    vk::Fence::null(),
-                )?;
-                lead_made = true;
-            }
-            let made = raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null()));
-            if made.is_err() && lead_made {
-                if let Ok(ending) = shared.fences.take(raw) {
-                    match raw.queue_submit(vk_queue, &[], ending) {
-                        Ok(()) => closing = Some(ending),
-                        // SAFETY: the failed submission is not pending.
-                        Err(_) => {
-                            release::object(raw, ending);
+                shared.submit_logged(queue, fence, &self.relayed, |vk_queue| unsafe {
+                    if !lead_buffers.is_empty() {
+                        raw.queue_submit(
+                            vk_queue,
+                            std::slice::from_ref(&lead_info),
+                            vk::Fence::null(),
+                        )?;
+                        lead_made = true;
+                    }
+                    let made =
+                        raw.queue_submit(vk_queue, infos, fence.unwrap_or(vk::Fence::null()));
+                    if made.is_err() && lead_made {
+                        if let Ok(ending) = shared.fences.take(raw) {
+                            match raw.queue_submit(vk_queue, &[], ending) {
+                                Ok(()) => closing = Some(ending),
+                                // SAFETY: the failed submission is not pending.
+                                Err(_) => {
+                                    release::object(raw, ending);
+                                }
+                            }
                         }
                     }
-                }
-            }
-            made
-        })
+                    made
+                })
             })
         };
         exit_guard::called(Call::QueueSubmit);

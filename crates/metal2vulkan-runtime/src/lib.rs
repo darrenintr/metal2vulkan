@@ -87,9 +87,9 @@ mod families;
 pub use execution::{ExecutedPipeline, Execution};
 mod exit_guard;
 pub use exit_guard::process_exiting;
-pub use scheduler::{defer_submissions, flush_deferred_submissions};
 #[doc(hidden)]
 pub use exit_guard::{registrations as exit_registrations, Registrations as ExitRegistrations};
+pub use scheduler::{defer_submissions, flush_deferred_submissions};
 mod executed_commands;
 mod fence;
 mod fetch_reach;

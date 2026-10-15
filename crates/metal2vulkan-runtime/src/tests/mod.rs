@@ -26,11 +26,11 @@ mod color_reformat;
 mod command_buffer;
 #[cfg(any(m2v_gpu, m2v_cpu_icd))]
 mod completion;
-#[cfg(any(m2v_gpu, m2v_cpu_icd))]
-mod deferred;
 mod compute;
 mod contexts;
 mod copy_plan;
+#[cfg(any(m2v_gpu, m2v_cpu_icd))]
+mod deferred;
 mod degradation;
 mod depth_stencil_resolve;
 mod descriptor_arena;
