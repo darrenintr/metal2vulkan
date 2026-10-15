@@ -370,10 +370,9 @@ fn a_restricted_context_runs_only_on_a_device_that_has_and_reports_its_profile()
     // A runtime fact stand-in is consumer configuration, absent from Vulkan's report. It
     // imposes no capability requirement and survives applying the restricted profile.
     let mut hinted = native.clone();
-    hinted.facts_stand_in = Some(metal2vulkan::device::FactsStandIn {
-        device_id: 0x15bf,
-        driver_version: (26 << 22) | (2 << 12) | 4,
-    });
+    let mut rdna3 = committed("amd-rdna3-radv");
+    rdna3.driver_version = (26 << 22) | (2 << 12) | 4;
+    hinted.facts_stand_in = Some(rdna3.rdna3_stand_in().expect("an eligible RDNA3 device"));
     assert!(exceeds(&native, &hinted).is_empty());
     assert!(exceeds(&hinted, &native).is_empty());
     assert!(differences(&native, &hinted).is_empty());
