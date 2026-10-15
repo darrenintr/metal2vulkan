@@ -542,6 +542,20 @@ fn a_dma_buf_window_is_the_pages_the_range_touches() {
 /// A source's chunks must cover the request, each a whole number of host pages, every boundary at
 /// a multiple of the granule; several chunks cover the request rounded up to the granule (the
 /// last one padded past the pages, as a sparse buffer binds whole granules), one chunk the request
+/// A chunk starts at 0 into its dma-buf, or, where the request takes offsets, at a multiple of its
+/// offset alignment.
+#[cfg(unix)]
+#[test]
+fn a_chunk_starts_into_its_dma_buf_at_the_request_s_alignment() {
+    use crate::dma_buf::offset_taken;
+    let page = 4096;
+    assert!(offset_taken(0, 0));
+    assert!(!offset_taken(page, 0));
+    assert!(offset_taken(0, 16 * page));
+    assert!(offset_taken(32 * page, 16 * page));
+    assert!(!offset_taken(8 * page, 16 * page));
+}
+
 /// or that rounding; one chunk is the only answer where the granule is the length.
 #[cfg(unix)]
 #[test]
@@ -553,6 +567,7 @@ fn a_source_s_chunks_cover_the_request_at_its_granule() {
         start,
         length,
         granule,
+        offset_alignment: 0,
     };
     let one = request(8 * page, 8 * page);
     assert!(chunks_cover(&[8 * page], &one, page));

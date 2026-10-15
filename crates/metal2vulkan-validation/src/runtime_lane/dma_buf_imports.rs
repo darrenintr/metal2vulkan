@@ -230,6 +230,7 @@ impl Memfd {
                     .map(|(items, length)| {
                         Ok(DmaBufChunk {
                             fd: udmabuf(fd.as_fd(), &items)?,
+                            offset: 0,
                             length,
                         })
                     })
@@ -719,6 +720,7 @@ fn shared_memory_is_refused_without_a_working_source() {
             let short: DmaBufSource = Arc::new(move |_| {
                 Ok(vec![DmaBufChunk {
                     fd: udmabuf(fd.as_fd(), &[(page as u64, page as u64)])?,
+                    offset: 0,
                     length: page as u64,
                 }])
             });
@@ -730,6 +732,7 @@ fn shared_memory_is_refused_without_a_working_source() {
         let file: DmaBufSource = Arc::new(move |request| {
             Ok(vec![DmaBufChunk {
                 fd: fd.try_clone()?,
+                offset: 0,
                 length: request.length,
             }])
         });

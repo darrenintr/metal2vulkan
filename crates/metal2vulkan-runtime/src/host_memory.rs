@@ -518,6 +518,10 @@ pub(super) struct Importer {
     /// the first time a pointer is refused and a source called; `None` where the device makes no
     /// such buffer.
     pub(super) sparse_granule: std::sync::OnceLock<Option<u64>>,
+    /// The alignment of a plain (not sparse) buffer made for dma-bufs, which a chunk's offset into
+    /// its dma-buf must meet where one chunk is bound to such a buffer (`dma_buf.rs`). Asked once,
+    /// as `sparse_granule` is.
+    pub(super) plain_alignment: std::sync::OnceLock<u64>,
 }
 
 /// The debug name of an image the runtime made of a Metal texture over an import's `MTLBuffer`
@@ -604,6 +608,7 @@ impl Importer {
             dma_buf,
             dma_buf_images,
             sparse_granule: std::sync::OnceLock::new(),
+            plain_alignment: std::sync::OnceLock::new(),
         })
     }
 
