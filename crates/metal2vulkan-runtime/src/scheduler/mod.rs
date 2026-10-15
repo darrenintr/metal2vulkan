@@ -515,7 +515,7 @@ fn pass_now(shared: &SchedulerShared) {
     let mut passes = 0;
     loop {
         passes += 1;
-        take_incoming(&shared, &mut state);
+        take_incoming(shared, &mut state);
         let (mut spent, mut settled) = (Spent::default(), Vec::new());
         let (mut steps, mut checks) = (Vec::new(), Vec::new());
         let mut handlers = Vec::new();
