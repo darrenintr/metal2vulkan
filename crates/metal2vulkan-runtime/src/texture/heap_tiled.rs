@@ -122,10 +122,11 @@
 //! any shadow's (`shadow_merge.rs`), the shadow's texels laid out tiled for it
 //! (`HeapTiledCopies::record_out`).
 
+use super::super::Device;
 use super::super::buffer::Buffer;
 use super::super::copy_plan::{block_bytes, block_extent, depth_bytes};
 use super::super::degradation::Degradation;
-use super::super::error::{internal, Error};
+use super::super::error::{Error, internal};
 use super::super::heap::SizeAndAlign;
 use super::super::image_plan::block_family;
 use super::super::metal_level::MetalLevel;
@@ -134,7 +135,6 @@ use super::super::shadow::ShadowStaging;
 use super::super::texture_descriptor::TextureLayout;
 use super::super::tracker::Barrier;
 use super::super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
-use super::super::Device;
 use super::copy_units;
 use super::heap::HeapPlane;
 use ash::vk;
@@ -1135,6 +1135,15 @@ pub(crate) struct HeapTiledCopies {
 }
 
 impl HeapTiledCopies {
+    /// Moving into and out of the image preserves exact bytes only for
+    /// single-sample, color-aspect regions. Multisampled images never use this
+    /// buffer-image copy path; depth/stencil may quantize or normalize values.
+    pub(crate) fn moves_bits(&self) -> bool {
+        self.regions
+            .iter()
+            .all(|region| region.image_subresource.aspect_mask == vk::ImageAspectFlags::COLOR)
+    }
+
     /// The kernel's levels of a texture of `layout` whose image's elements lie in the tight
     /// buffer as `planes` say (`heap_plane_layout`, one plane a level); `None` where a byte the
     /// moves name lies past `u32`, or the planes are not the levels'.

@@ -74,17 +74,17 @@
 //!   rests in `GENERAL` as its contract says: handing it out does its work first, by an internal
 //!   submission waited for.
 
+use super::super::Device;
 use super::super::creation;
 use super::super::device::lock;
-use super::super::error::{internal, vulkan, Error, MemoryKind};
+use super::super::error::{Error, MemoryKind, internal, vulkan};
 use super::super::exit_guard::{self, Call};
 use super::super::memory::{Memory, MemoryClass, Placement};
 use super::super::release;
 use super::super::resource::ResourceKey;
 use super::super::tracker::Point;
-use super::super::Device;
 use super::decoded_twin::DecodePass;
-use super::{buffer_image_copy, image_aspects, transfer_barrier, ImageRegion, ZERO_BYTES};
+use super::{ImageRegion, ZERO_BYTES, buffer_image_copy, image_aspects, transfer_barrier};
 use ash::vk;
 use metal2vulkan::vk::Format;
 use std::any::Any;
@@ -548,6 +548,9 @@ pub(crate) struct FirstFill {
     buffer: vk::Buffer,
     source: vk::Buffer,
     copies: Vec<vk::BufferCopy>,
+    /// A discrete GPU can zero aligned new buffers in place, without reading
+    /// a host-visible zero buffer over PCIe.
+    filled: Option<std::ops::Range<u64>>,
     /// What keeps the staging buffer `source` is, held until the submission that makes the fill
     /// completed; `None` where `source` is the device's zeros.
     staging: Option<Box<dyn Any + Send + Sync>>,
@@ -570,8 +573,53 @@ impl FirstFill {
             buffer,
             source: zeros,
             copies,
+            filled: None,
             staging: None,
         }
+    }
+
+    /// A direct fill is legal only for aligned, nonempty byte ranges on a
+    /// discrete device whose fill commands are not lowered to transfers.
+    fn fill_directly(
+        discrete: bool,
+        fills_by_transfer: bool,
+        range: &std::ops::Range<u64>,
+    ) -> bool {
+        discrete
+            && !fills_by_transfer
+            && !range.is_empty()
+            && range.start.is_multiple_of(4)
+            && range.end.is_multiple_of(4)
+    }
+
+    /// Choose either one GPU-native zero fill or the original copy of zeros.
+    fn zeros(
+        device: &Device,
+        moves: &FirstMoves,
+        buffer: vk::Buffer,
+        range: std::ops::Range<u64>,
+    ) -> Result<FirstFill, Error> {
+        let discrete = !device.properties().has_unified_memory;
+        let transfers = device
+            .properties()
+            .driver_facts
+            .contains(&metal2vulkan::device::DriverFact::FillCompiledPerCommandPool);
+        if Self::fill_directly(discrete, transfers, &range) {
+            return Ok(FirstFill {
+                buffer,
+                source: vk::Buffer::null(),
+                copies: Vec::new(),
+                filled: Some(range),
+                staging: None,
+            });
+        }
+        let zeros = moves.zeros(device, 0)?;
+        Ok(Self::new(
+            buffer,
+            range.start,
+            range.end - range.start,
+            zeros,
+        ))
     }
 
     /// The copy of `length` bytes of `source` from byte `from` onto `buffer` from byte `start`,
@@ -591,6 +639,7 @@ impl FirstFill {
                 dst_offset: start,
                 size: length,
             }],
+            filled: None,
             staging: Some(staging),
         }
     }
@@ -778,8 +827,7 @@ impl FirstMoves {
         buffer: vk::Buffer,
         range: std::ops::Range<u64>,
     ) -> Result<(), Error> {
-        let zeros = self.zeros(device, 0)?;
-        let fill = FirstFill::new(buffer, range.start, range.end - range.start, zeros);
+        let fill = FirstFill::zeros(device, self, buffer, range)?;
         let _order = lock(&self.order);
         lock(&self.waiting).push(Waiting::Fill(keeper, fill));
         Ok(())
@@ -1329,6 +1377,21 @@ impl Taken<'_> {
                 }
                 exit_guard::called(Call::CmdPipelineBarrier);
             }
+            if let Some(words) = &fill.filled {
+                // The original zero buffer copy would read host-visible memory on
+                // a discrete GPU. vkCmdFillBuffer writes the aligned words locally.
+                // All later reads are ordered by the existing transfer barrier.
+                unsafe {
+                    device.cmd_fill_buffer(
+                        command_buffer,
+                        fill.buffer,
+                        words.start,
+                        words.end - words.start,
+                        0,
+                    );
+                }
+                continue;
+            }
             // SAFETY: as above; every copy lies within its source, the device's zeros (live and
             // `ZERO_BYTES` long) or a staging buffer the fill keeps, and within the buffer,
             // held, which has `TRANSFER_DST` usage as every buffer of the runtime's.
@@ -1522,6 +1585,17 @@ mod tests {
         let fill = FirstFill::new(vk::Buffer::from_raw(raw), 16, length, vk::Buffer::null());
         lock(&moves.waiting).push(Waiting::Fill(weak, fill));
         buffer
+    }
+
+    #[test]
+    fn native_zero_fill_only_for_aligned_discrete_buffer_ranges() {
+        let aligned = 16..(16 + 512 * 1024);
+        assert!(FirstFill::fill_directly(true, false, &aligned));
+        assert!(!FirstFill::fill_directly(false, false, &aligned));
+        assert!(!FirstFill::fill_directly(true, true, &aligned));
+        assert!(!FirstFill::fill_directly(true, false, &(1..512)));
+        assert!(!FirstFill::fill_directly(true, false, &(0..509)));
+        assert!(!FirstFill::fill_directly(true, false, &(16..16)));
     }
 
     #[test]

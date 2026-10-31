@@ -6,14 +6,14 @@
 use super::memo::Remembered;
 use super::render::RenderVariant;
 use super::{Kernel, PipelineOptions, Variant};
-use crate::binary_archive::{Artifact, BinaryArchive, Used};
 use crate::Device;
+use crate::binary_archive::{Artifact, BinaryArchive, Used};
+use metal2vulkan::Budget;
 use metal2vulkan::cache::PipelineKey;
 use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
 use metal2vulkan::pipeline::{
     ComputePipeline, FunctionDescriptor, LoweringInputs, RenderPipeline, StageEntries,
 };
-use metal2vulkan::Budget;
 use std::sync::Arc;
 
 /// Where one creation's (or one later variant's) compiles look, and its budget.
@@ -111,6 +111,27 @@ impl<'a> Sources<'a> {
         };
         self.note(Artifact::Function(compiled.clone()));
         Ok(compiled)
+    }
+
+    /// Find an already-translated shader solely by stage compile key.
+    /// A cache miss never decodes Metal AIR; the cold path handles compilation.
+    pub(crate) fn found_function(&self, key: &FunctionCompileKey) -> Option<CompiledFunction> {
+        let compile = self.device.compile_device();
+        let cache = &self.device.shared().shader_cache;
+        let compiled = match cache.memo.function(key) {
+            Some(compiled) => compiled,
+            None => {
+                let (compiled, bytes) = self
+                    .archives()
+                    .iter()
+                    .find_map(|archive| archive.function(compile, key))
+                    .or_else(|| cache.load_function(compile, key))?;
+                cache.memo.keep_function(&compiled, bytes);
+                compiled
+            }
+        };
+        self.note(Artifact::Function(compiled.clone()));
+        Some(compiled)
     }
 
     /// The compute pipeline of `descriptor`, a compute or tile descriptor whose kernel or tile

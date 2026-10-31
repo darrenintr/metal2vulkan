@@ -25,15 +25,15 @@
 //! It costs the scratch, three copies and the dispatches in place of one copy back, which the
 //! runtime announces once per device (`shadow-merge`, performance).
 
+use super::Device;
 use super::buffer::Buffer;
 use super::degradation::Degradation;
-use super::error::{internal, Error};
+use super::error::{Error, internal};
 use super::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
 use super::resource::ResourceKey;
 use super::shadow::{ShadowCopies, ShadowSource};
 use super::tracker::{Access, Barrier, Use, UseRange};
 use super::values::ResourceOptions;
-use super::Device;
 use ash::vk;
 use metal2vulkan::bind::ShadowMergeModule;
 use std::ops::Range;
@@ -234,6 +234,20 @@ impl ShadowMerge {
         let [kept, _, _] = self.parts;
         // SAFETY: the caller's contract; the kept part holds the texture's bytes.
         unsafe { copies.record_out(device, command_buffer, kept.raw, kept.at) };
+    }
+
+    /// Reuse the staging buffer as the kept part where it is exactly the
+    /// single-sample color image's unchanged bytes after an adjacent move in.
+    ///
+    /// Safety: as record_keep, with no command between move in and keep.
+    pub(super) unsafe fn record_keep_from_staging(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        copies: &ShadowCopies,
+    ) {
+        let [kept, _, _] = self.parts;
+        unsafe { copies.record_kept_from_staging(device, command_buffer, kept.raw, kept.at) };
     }
 
     /// Record the merge of the shadow of `copies` into its buffer's bytes (the module docs).

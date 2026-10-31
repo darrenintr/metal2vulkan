@@ -96,9 +96,9 @@ use super::error::{Error, RuntimeGap};
 use super::resource::ResourceKey;
 use super::rotated::{RotatedCopies, Turn};
 use super::shadow_merge::ShadowMerge;
+use super::texture::Texture;
 use super::texture::heap_tiled::HeapTiledCopies;
 use super::texture::heap_two_planes::HeapPlaneCopies;
-use super::texture::Texture;
 use super::tracker::{Access, Barrier, Use, UseRange};
 use super::view_plan::reinterpretation_refused;
 use super::ycbcr::{YCbCrConversion, YCbCrWriteBack};
@@ -286,6 +286,46 @@ impl ShadowStaging {
 }
 
 impl ShadowCopies {
+    /// Only a tiled single-sample color texture can reuse its input staging
+    /// bytes for a merge keep recorded immediately after its move in.
+    pub(super) fn keeps_from_staging(&self) -> bool {
+        matches!(
+            &self.source,
+            ShadowSource::Bytes {
+                target: ShadowTarget::Tiled { tiles, .. },
+                ..
+            } if tiles.moves_bits()
+        )
+    }
+
+    /// Copy the bytes staged for the immediately preceding move in directly
+    /// into a merge's kept part, skipping the image-to-buffer roundtrip.
+    ///
+    /// Safety: caller recorded the matching move in immediately beforehand,
+    /// with no intervening writes to the image or staging buffer; both buffers
+    /// are live until command completion and the destination span is large enough.
+    pub(super) unsafe fn record_kept_from_staging(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        to: vk::Buffer,
+        at: u64,
+    ) {
+        let ShadowSource::Bytes {
+            target: ShadowTarget::Tiled { staging, .. },
+            ..
+        } = &self.source
+        else {
+            return;
+        };
+        let region = vk::BufferCopy {
+            src_offset: staging.into.dst_offset,
+            dst_offset: at,
+            size: staging.into.size,
+        };
+        unsafe { device.cmd_copy_buffer(command_buffer, staging.raw(), to, &[region]) };
+    }
+
     /// Whether the shadow is a heap's two-plane texture's, whose truth is its two planes in the
     /// heap's bytes ([`ShadowTarget::Planes`]).
     pub(super) fn holds_planes(&self) -> bool {
@@ -580,6 +620,22 @@ impl ShadowCopy {
             Step::Keep(merge) => merge.keep_uses(c),
             Step::Merge(merge) => merge.merge_uses(c),
         }
+    }
+
+    /// An immediate tiled-color keep can reuse the staged heap bytes.
+    /// All other keeps retain their normal, fully general image readback.
+    pub(super) unsafe fn record_keep_from_staging(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+    ) {
+        if let Step::Keep(merge) = &self.step {
+            if self.copies.keeps_from_staging() {
+                unsafe { merge.record_keep_from_staging(device, command_buffer, &self.copies) };
+                return;
+            }
+        }
+        unsafe { self.record(device, command_buffer) };
     }
 
     /// Record the copy into `command_buffer`.

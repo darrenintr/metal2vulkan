@@ -35,6 +35,7 @@
 //!
 //! [`Function::function_descriptor`]: crate::Function::function_descriptor
 
+use super::BufferForms;
 use super::creation_log::{self, StateLog};
 use super::graphics::{GraphicsKey, Notices};
 use super::kept::{Compiled, Place};
@@ -47,22 +48,22 @@ use super::pool::Joined;
 use super::sources::Sources;
 use super::texture_access::{TextureAccessMemo, TextureAccesses};
 use super::tile::TileState;
-use super::BufferForms;
-use super::{compile_error, stand_in, PipelineOptions, PIPELINES, PLANS, VARIANTS};
+use super::{PIPELINES, PLANS, PipelineOptions, VARIANTS, compile_error, stand_in};
+use crate::Device;
 use crate::binary_archive::{self, Used};
 use crate::degradation::{BoundFormats, Degradation, Occurrence};
 use crate::device::{device_error, lock};
-use crate::error::{internal, invalid, ArchivedPipeline, Error, Problem, RuntimeGap};
+use crate::error::{ArchivedPipeline, Error, Problem, RuntimeGap, internal, invalid};
 use crate::framebuffer_fetch;
 use crate::render_target::RenderPassObject;
 use crate::residency::{every_render_stage, handle_stages};
 use crate::resource_ids::{
-    function_name, number, pipeline_placement, Holder, IdHold, IdPlacement, IdSpace, Numbered,
-    NumberedStage, ResourceId, StateKind,
+    Holder, IdHold, IdPlacement, IdSpace, Numbered, NumberedStage, ResourceId, StateKind,
+    function_name, number, pipeline_placement,
 };
+use crate::shader_cache::VariantStages;
 use crate::unique_identifier::UniqueIdentifier;
 use crate::values::Size;
-use crate::Device;
 use metal2vulkan::bind::{BindShape, BindingPlan, FragmentTests};
 use metal2vulkan::cache::{PipelineKey, SpecializationKey, VariantKey};
 use metal2vulkan::metal::{BindingAccess, PixelFormat, PrimitiveTopologyClass, RenderStages};
@@ -604,7 +605,7 @@ impl Device {
                 Some(loaded.reflection(&options.budget()).map_err(device_error)?)
             }
             (true, StateDescriptor::Vertex(_)) => {
-                return Err(internal("a mesh state made of a render descriptor"))
+                return Err(internal("a mesh state made of a render descriptor"));
             }
             (false, _) => None,
         };
@@ -2035,13 +2036,23 @@ impl RenderVariant {
         // without asking its keys again; else the keys, kept for the next one.
         let cache = &sources.device().shared().shader_cache;
         let descriptor_key = compile.render_descriptor_key(descriptor);
-        if let Some(pipeline) = cache.variant_pipeline(compile, &descriptor_key, key) {
-            if let Some(found) = sources.render(&pipeline) {
+        if let Some(stages) = cache.variant_pipeline(compile, &descriptor_key, key) {
+            if let Some(found) = sources.render(&stages.pipeline) {
                 return Ok(found);
+            }
+            if let Some(linked) = Self::kept_stages(sources, descriptor, &stages) {
+                // Re-link cached functions without decoding their AIR.
+                let pipeline = compile.compile_render_variant(&linked, key, &budget)?;
+                return Ok(Remembered::Compiled(sources.linked_render(pipeline)));
             }
         }
         let keys = compile.render_variant_key(descriptor, key, &budget, entries)?;
-        cache.keep_variant_pipeline(compile, &descriptor_key, key, &keys.pipeline);
+        let stages = VariantStages {
+            pipeline: keys.pipeline,
+            vertex: keys.vertex,
+            fragment: keys.fragment,
+        };
+        cache.keep_variant_pipeline(compile, &descriptor_key, key, &stages);
         if let Some(found) = sources.render(&keys.pipeline) {
             return Ok(found);
         }
@@ -2068,6 +2079,27 @@ impl RenderVariant {
         }
         let pipeline = compile.compile_render_variant(&linked, key, &budget)?;
         Ok(Remembered::Compiled(sources.linked_render(pipeline)))
+    }
+
+    /// Restore translated stage artifacts using their saved keys, without an AIR decode.
+    /// A missing stage forces the safe cold pipeline path instead.
+    fn kept_stages(
+        sources: &Sources<'_>,
+        descriptor: &RenderPipelineDescriptor,
+        stages: &VariantStages,
+    ) -> Option<RenderPipelineDescriptor> {
+        let mut linked = descriptor.clone();
+        if let StageSource::Function(_) = &descriptor.vertex {
+            linked.vertex = StageSource::Compiled(sources.found_function(&stages.vertex)?);
+        }
+        match (&descriptor.fragment, &stages.fragment) {
+            (Some(StageSource::Function(_)), Some(fragment)) => {
+                linked.fragment = Some(StageSource::Compiled(sources.found_function(fragment)?));
+            }
+            (Some(StageSource::Compiled(_)), _) | (None, None) => {}
+            (Some(StageSource::Function(_)), None) | (None, Some(_)) => return None,
+        }
+        Some(linked)
     }
 
     /// The variant of `key` of what the memo or a compile `found`: the live variant, or one made
@@ -2517,7 +2549,7 @@ impl RenderVariant {
             _ => {
                 return Err(internal(
                     "an emulated mesh pipeline of other compute stages",
-                ))
+                ));
             }
         };
         Ok(made)

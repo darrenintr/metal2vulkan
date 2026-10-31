@@ -27,9 +27,10 @@
 //! - Encoders are `Send` but not `Sync`: every method takes `&mut self`, and the core holds a
 //!   `!Sync` marker so no encoder is shared between threads by reference.
 
+use super::Device;
 use super::command_buffer::CommandBuffer;
 use super::deferred::{Deferred, StepInputs};
-use super::error::{internal, invalid, vulkan, CommandBufferError, Error, Problem};
+use super::error::{CommandBufferError, Error, Problem, internal, invalid, vulkan};
 use super::execution::Execution;
 use super::fresh_unwritten::FreshRead;
 use super::heap::Heap;
@@ -43,14 +44,13 @@ use super::shadow_merge::ShadowMerge;
 use super::sparse::encoder::SparseUpdate;
 use super::tracker::{Barrier, EncoderUses, Summary, Use, UseRange};
 use super::used_resources::EncoderKind;
-use super::Device;
 use ash::vk;
 use metal2vulkan::bind::{ReplayFaults, ResidentRange};
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The cores made so far in the process: the next one's [`EncoderCore::id`].
 static CORES: AtomicU64 = AtomicU64::new(0);
@@ -708,7 +708,12 @@ impl EncoderCore {
     /// is, in an encoder Metal orders; with a barrier from everything before and one to
     /// everything after each copy, in one whose commands Metal leaves unordered.
     pub(super) fn shadow_copies(&mut self, copies: &[ShadowCopy]) {
-        for copy in copies {
+        for (i, copy) in copies.iter().enumerate() {
+            let reuse_staging = i > 0
+                && matches!(&copies[i - 1].step, Step::Into)
+                && matches!(&copy.step, Step::Keep(_))
+                && Arc::ptr_eq(&copies[i - 1].copies, &copy.copies)
+                && copy.copies.keeps_from_staging();
             let stages = copy.stages();
             let uses = copy.uses();
             if self.uses.ordered() {
@@ -716,7 +721,13 @@ impl EncoderCore {
                     // SAFETY: the encoder's command buffer is recording outside a render pass;
                     // its commands retain the shadowed textures until it completes, and every
                     // image rests in the `GENERAL` layout.
-                    unsafe { copy.record(device, raw) }
+                    unsafe {
+                        if reuse_staging {
+                            copy.record_keep_from_staging(device, raw)
+                        } else {
+                            copy.record(device, raw)
+                        }
+                    }
                 });
             } else {
                 // A copy of a detached buffer's bytes records nothing, nor does what follows.
@@ -725,7 +736,13 @@ impl EncoderCore {
                 }
                 self.barrier(Barrier::everything());
                 // SAFETY: as above.
-                unsafe { copy.record(self.device().shared().vk(), self.raw) };
+                unsafe {
+                    if reuse_staging {
+                        copy.record_keep_from_staging(self.device().shared().vk(), self.raw);
+                    } else {
+                        copy.record(self.device().shared().vk(), self.raw);
+                    }
+                };
                 self.barrier(Barrier::everything());
                 let aliased = self.aliased(&uses);
                 self.uses

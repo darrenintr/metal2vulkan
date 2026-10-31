@@ -35,13 +35,14 @@
 //!   default). An entry read or written here is kept there, weighed at its encoded length.
 
 mod creation;
+pub(crate) use creation::VariantStages;
 pub(crate) mod driver;
 pub(super) mod store;
 mod worker;
 
-use super::error::{invalid, Error, Problem, ShaderCacheError};
-use super::pipeline::memo::PipelineMemo;
 use super::Device;
+use super::error::{Error, Problem, ShaderCacheError, invalid};
+use super::pipeline::memo::PipelineMemo;
 use crate::MessageSink;
 use ash::vk;
 use creation::CreationMemo;
@@ -51,9 +52,9 @@ use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
 use metal2vulkan::pipeline::{ComputePipeline, RenderPipeline};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use store::{count, entry_name, Directory, Lookup, Store};
+use std::sync::atomic::Ordering;
+use store::{Directory, Lookup, Store, count, entry_name};
 use worker::Worker;
 
 /// The default cap of a cache directory, in bytes: 25 GiB.
