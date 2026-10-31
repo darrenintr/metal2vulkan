@@ -323,7 +323,13 @@ impl ShadowCopies {
             dst_offset: at,
             size: staging.into.size,
         };
-        unsafe { device.cmd_copy_buffer(command_buffer, staging.raw(), to, &[region]) };
+        // The prior move-in wrote the staging buffer. An explicit full
+        // memory barrier makes that write visible even if hazard tracking
+        // models only the shadow image in this optional fast path.
+        unsafe {
+            Barrier::everything().record(device, command_buffer);
+            device.cmd_copy_buffer(command_buffer, staging.raw(), to, &[region]);
+        }
     }
 
     /// Whether the shadow is a heap's two-plane texture's, whose truth is its two planes in the
