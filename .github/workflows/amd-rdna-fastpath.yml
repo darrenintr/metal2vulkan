@@ -42,9 +42,9 @@ jobs:
       - name: Check RDNA module formatting
         run: rustfmt --edition 2021 --check crates/metal2vulkan-runtime/src/amd_rdna.rs
       - name: Check Vulkan runtime crate
-        run: cargo check --locked -p metal2vulkan-runtime
+        run: cargo check -p metal2vulkan-runtime
       - name: Test AMD detection and safe defaults
-        run: cargo test --locked -p metal2vulkan-runtime --lib amd_rdna -- --nocapture
+        run: cargo test -p metal2vulkan-runtime --lib amd_rdna -- --nocapture
       - name: Validate shell syntax and CLI
         run: |
           bash -n scripts/amd-rdna-baseline.sh
