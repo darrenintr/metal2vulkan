@@ -1283,6 +1283,9 @@ impl Device {
         }
         let device = Device(shared);
         device.say_unmeasured_driver();
+        if let Some(message) = crate::amd_rdna::diagnostic(&device.properties().description) {
+            device.inform("metal2vulkan-amd-profile", message);
+        }
         device.degrade_argument_buffers_unread();
         if let Some((kind, notice)) = metal_level.announcement() {
             device.degrade(kind, || notice);
