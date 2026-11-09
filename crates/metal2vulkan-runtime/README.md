@@ -56,6 +56,17 @@ ash = { version = "0.38", default-features = false, features = ["std"] }
   directory, and in memory ([HOWTO](../../docs/HOWTO.md#the-runtimes-shader-cache)).
   `ShaderCacheOptions` names another directory; give each test its own.
 
+## AMD RADV batching experiment (fork)
+
+On `darrenintr/metal2vulkan`'s `feature/amd-rdna3-fastpath`, the existing
+coalescing scheduler accepts `M2V_AMD_RUN_LIMIT` (1..=1024) on RADV and
+listed discrete Navi 31/32/33 devices only. Without a valid opt-in
+the limit remains 64 on all GPUs. `M2V_AMD_DIAG=1` prints the device's
+identity and effective limit; `M2V_SCHED_STATS=1` prints the existing
+submission statistics. No shader or Metal-visible behavior changes.
+For the A/B procedure and identity/synchronization boundary, see the
+[AMD RADV batching guide](../../docs/AMD-RDNA-FASTPATH.md).
+
 ## A first dispatch
 
 From [`examples/compute_dispatch.rs`](examples/compute_dispatch.rs):
