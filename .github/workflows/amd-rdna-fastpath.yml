@@ -1,0 +1,49 @@
+name: AMD RDNA3 fast-path checks
+
+on:
+  push:
+    branches:
+      - feature/amd-rdna3-fastpath
+    paths:
+      - "crates/metal2vulkan-runtime/**"
+      - "crates/metal2vulkan/**"
+      - "scripts/amd-rdna-*"
+      - ".github/workflows/amd-rdna-fastpath.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/metal2vulkan-runtime/**"
+      - "crates/metal2vulkan/**"
+      - "scripts/amd-rdna-*"
+      - ".github/workflows/amd-rdna-fastpath.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-unit-test:
+    name: Rust / AMD gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt
+          rustup default 1.98.0
+      - name: Check RDNA module formatting
+        run: rustfmt --edition 2021 --check crates/metal2vulkan-runtime/src/amd_rdna.rs
+      - name: Check Vulkan runtime crate
+        run: cargo check --locked -p metal2vulkan-runtime
+      - name: Test AMD detection and safe defaults
+        run: cargo test --locked -p metal2vulkan-runtime --lib amd_rdna -- --nocapture
+      - name: Validate shell syntax and CLI
+        run: |
+          bash -n scripts/amd-rdna-baseline.sh
+          bash scripts/amd-rdna-baseline.sh --help
+      - name: Compare parser unit tests
+        run: python3 -m unittest discover -s scripts -p "test_amd_rdna_*.py" -v
