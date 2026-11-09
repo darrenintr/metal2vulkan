@@ -25,8 +25,8 @@
 
 mod address;
 mod address_map;
-mod amd_rdna;
 mod address_pool;
+mod amd_rdna;
 mod amplification;
 mod apple_only;
 mod argument_encoder;
