@@ -30,8 +30,8 @@ use crate::exit_guard::{self, Call};
 use ash::vk;
 use std::sync::Arc;
 
-/// The most batches one submission takes.
-const RUN_LIMIT: usize = 64;
+// AMD/RADV may experimentally choose a bounded, device-specific run limit;
+// the generic limit remains 64 and every existing dependency check applies.
 
 /// Diagnostics (`M2V_SCHED_STATS`): submissions, the batches they took, and why each run ended.
 pub(crate) mod stats {
@@ -118,7 +118,7 @@ impl Coalesced {
         if self.batches > 0 {
             let end = if self.queue != Some(queue) {
                 Some(0)
-            } else if self.batches >= RUN_LIMIT {
+            } else if self.batches >= crate::amd_rdna::run_limit(&device.properties().description) {
                 Some(1)
             } else if self.conflicts(&part) {
                 Some(2)
