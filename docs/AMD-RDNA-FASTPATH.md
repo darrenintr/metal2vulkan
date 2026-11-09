@@ -1,6 +1,52 @@
 # AMD RDNA3 fast-path experiment
 
-Status: **experimental plan only**. Creating this branch does **not** enable new runtime fast paths or establish a performance gain.
+Status: **implemented, opt-in scheduler prototype; not yet verified on the RX 7600**.
+A bounded RADV+discrete-RDNA3 submission-batching experiment is now wired into the runtime.
+All other GPU/driver combinations, and no environment override, preserve the upstream
+64-batch limit. The branch's correctness/CI and actual macOS guest performance are not yet established.
+
+## Implemented first experiment
+
+The implementation is in `crates/metal2vulkan-runtime/src/amd_rdna.rs`, with the
+batch limit consulted by `scheduler/coalesce.rs` and an opt-in identity diagnostic at
+device creation.
+
+- `M2V_AMD_RUN_LIMIT=128` (or 1..1024): **only** on vendor `0x1002`, a listed
+  Navi 31/32/33 device ID and `DriverId::MESA_RADV`. Empty, invalid or out-of-range
+  values are ignored; the default remains 64 on all devices.
+- `M2V_AMD_DIAG=1`: print the actual runtime identity, selected limit, subgroup
+  size and stand-in flag once at device creation. Without the setting no report is produced.
+- `M2V_SCHED_STATS=1`: the existing runtime emits one-second batch/submission
+  summaries, including why a batch run ended.
+- No changes to Shader IR, Metal-visible answers, semaphore/fence dependencies,
+  DMA-BUF ownership or Reims' guest protocol.
+
+Use the **same** VM/session with two separately recorded runs and otherwise
+identical conditions:
+
+```sh
+# In the process environment used by the experimental Reims binary.
+M2V_AMD_DIAG=1 M2V_SCHED_STATS=1 M2V_AMD_RUN_LIMIT=64 <launch-your-Reims-VM> 2> baseline.log
+M2V_AMD_DIAG=1 M2V_SCHED_STATS=1 M2V_AMD_RUN_LIMIT=128 <launch-your-Reims-VM> 2> experimental.log
+python3 scripts/amd_rdna_compare.py baseline.log experimental.log --json
+```
+
+The angle-bracket launch command is a placeholder; use your existing VM launcher
+without changing its disk or profile. **Do not run both VM commands concurrently.**
+Logs contain one-second aggregates (not frame-level timings), so the comparator
+never claims better FPS or p95/p99. Gather Reims presentation timing separately.
+
+Local non-GPU test gate:
+
+```sh
+cargo check --locked -p metal2vulkan-runtime
+cargo test --locked -p metal2vulkan-runtime --lib amd_rdna
+python3 -m unittest discover -s scripts -p 'test_amd_rdna_*.py' -v
+```
+
+The GitHub Actions workflow `.github/workflows/amd-rdna-fastpath.yml` also
+runs these checks. **Compilation and RX 7600 validation remain pending until the
+workflow has passed and a matching Reims build has booted.**
 
 ## Baseline and integration
 
