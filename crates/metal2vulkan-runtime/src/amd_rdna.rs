@@ -131,7 +131,14 @@ mod tests {
 
     #[test]
     fn rejects_missing_out_of_range_and_malformed_values() {
-        for input in [None, Some(""), Some("0"), Some("1025"), Some("-1"), Some("abc")] {
+        for input in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1025"),
+            Some("-1"),
+            Some("abc"),
+        ] {
             assert_eq!(parse_run_limit(input), None);
         }
         assert_eq!(parse_run_limit(Some(" 1 ")), Some(1));
